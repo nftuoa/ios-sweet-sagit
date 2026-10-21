@@ -1,0 +1,162 @@
+diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
+index 75f3db0..a086c10 100644
+--- a/osfmk/arm/pmap/pmap.h
++++ b/osfmk/arm/pmap/pmap.h
+@@ -111,6 +111,14 @@
+  * Upper limit on how many pages can be consumed by bootstrap page tables
+  */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 34)
++#elif defined(ARM64_BOARD_CONFIG_SAGIT)
++/*
++ * 4 KiB granule, ~2 GiB of DRAM above phys_base: 2 roots (V=P and KVA) plus
++ * three L2 tables per mapping (an L2 block covers only 2 MiB, an L2 page
++ * covers 1 GiB), plus one L2 table for the 36 MiB splash framebuffer.  Round
++ * up to 16 pages so the capacity check in arm_vm_init has margin.
++ */
++#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 16)
+ #else /* defined(ARM_LARGE_MEMORY) */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 8)
+ #endif /* defined(ARM_LARGE_MEMORY) */
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 2656454..99a047c 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -598,8 +598,19 @@ Lsweet_mark_pixel:
+ 	// Invalidate all entries in the bootstrap page tables
+ 	mov		x0, #(ARM_TTE_EMPTY)				// Load invalid entry template
+ 	mov		x1, x25								// Start at V=P pagetable root
++#if defined(ARM64_BOARD_CONFIG_SAGIT)
++	/*
++	 * The 4 KiB sagit layout needs more than the four pages upstream clears:
++	 * at least nine table pages (2 roots, 3+3 L2 tables for ~2 GiB of DRAM, 1
++	 * for the splash framebuffer) and BOOTSTRAP_TABLE_SIZE is 16.  Clear the
++	 * whole pool so no stale entry from the loaded image can be interpreted
++	 * as a valid translation by the MMU walker.
++	 */
++	mov		x2, #(16 * ARM_PGBYTES / 8)
++#else
+ 	mov		x2, #(TTE_PGENTRIES)				// Load number of entries per page
+ 	lsl		x2, x2, #2							// Shift by 2 for num entries on 4 pages
++#endif
+ 
+ Linvalidate_bootstrap:							// do {
+ 	str		x0, [x1], #(1 << TTE_SHIFT)			//   Invalidate and advance
+@@ -685,28 +696,81 @@ Lkernelcache_base_found:
+ 
+ #if defined(SWEET)
+ 	/*
+-	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+-	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+-	 * create_bootstrap_mapping would replace the RAM L2 table.
+-	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+-	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
++	 * Splash framebuffer identity map: Normal-NC, so the early console and
++	 * the fbcon built on it can draw before arm_vm_init installs the real
++	 * pmap.  The mapping goes into the EXISTING V=P tables (a second call to
++	 * create_bootstrap_mapping would replace the RAM tables).
+ 	 */
+ #if defined(ARM64_BOARD_CONFIG_SAGIT)
++	/*
++	 * 4 KiB granule (MSM8998 implements only TGran4): an L2 block is 2 MiB,
++	 * so the 36 MiB splash region at 0x9d400000 needs 18 block entries in a
++	 * fresh L2 table.  0x9d400000 falls in L1 index 2 of the V=P root
++	 * (0x80000000..0xBFFFFFFF), while the DRAM mapping starts at phys_base
++	 * 0x1_xxxxxxx, which is L1 index 4: the entry is free and the block base
++	 * is 2 MiB aligned, so no descriptor bits are wasted.
++	 */
+ 	MOV64	x10, 0x9d400000
++	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	orr	x11, x11, x10				// block descriptor for 0x9d400000
++	add	x13, x2, PGBYTES			// next free bootstrap table page
++	orr	x14, x13, #(ARM_TTE_BOOT_TABLE)		// table descriptor for the new L2
++	and	x12, x10, #(ARM_TT_L1_INDEX_MASK)
++	lsr	x12, x12, #(ARM_TT_L1_SHIFT)
++	str	x14, [x25, x12, lsl #TTE_SHIFT]		// V=P L1[index(0x9d400000)] = new L2
++	and	x12, x10, #(ARM_TT_L2_INDEX_MASK)
++	lsr	x12, x12, #(ARM_TT_L2_SHIFT)
++	add	x13, x13, x12, lsl #TTE_SHIFT		// L2 slot for 0x9d400000
++	mov	x14, #(0x2400000 / ARM_TT_L2_SIZE)	// 18 * 2 MiB = 36 MiB
++	mov	x15, #(ARM_TT_L2_SIZE)
++1:	str	x11, [x13], #(1 << TTE_SHIFT)
++	add	x11, x11, x15
++	subs	x14, x14, #1
++	b.ne	1b
+ #else
++	/*
++	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
++	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES; one 32MB block there
++	 * maps the whole splash framebuffer.
++	 */
+ 	MOV64	x10, 0x9c000000
+-#endif
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++#endif
+ #endif
+ 
+ 	/* Ensure TTEs are visible */
+ 	dsb		ish
+ 
++#if defined(ARM64_BOARD_CONFIG_SAGIT)
++	/* Stage marker, MMU still off: yellow band above the stage-0 one. */
++	MOV64	x0, (0x9d400000 + 1824 * 4320)
++	mov	w1, #0x00FFFF00
++	mov	x2, #8
++	mov	x4, #4320
++Lsagit_pre_mmu_row:
++	mov	x3, #64
++	mov	x5, x0
++Lsagit_pre_mmu_pixel:
++	str	w1, [x5], #4
++	subs	x3, x3, #1
++	b.ne	Lsagit_pre_mmu_pixel
++	add	x0, x0, x4
++	subs	x2, x2, #1
++	b.ne	Lsagit_pre_mmu_row
++	dsb	sy
++#endif
++
++
++	b		common_start
++
++	/* Ensure TTEs are visible */
++	dsb		ish
++
+ 
+ 	b		common_start
+ 
+@@ -846,6 +910,30 @@ common_start:
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
+ 
++#if defined(ARM64_BOARD_CONFIG_SAGIT)
++	/*
++	 * Stage marker, MMU on: magenta band.  This is the first write through
++	 * the splash framebuffer mapping; if the TCR granule or that mapping is
++	 * wrong the fetch/write faults and no further marker (nor any SWEET
++	 * EARLY line) appears.
++	 */
++	MOV64	x0, (0x9d400000 + 1840 * 4320)
++	mov	w1, #0xFFFF00FF
++	mov	x2, #8
++	mov	x4, #4320
++Lsagit_post_mmu_row:
++	mov	x3, #64
++	mov	x5, x0
++Lsagit_post_mmu_pixel:
++	str	w1, [x5], #4
++	subs	x3, x3, #1
++	b.ne	Lsagit_post_mmu_pixel
++	add	x0, x0, x4
++	subs	x2, x2, #1
++	b.ne	Lsagit_post_mmu_row
++	dsb	sy
++#endif
++
+ #if !VMAPPLE && !defined(SWEET)
+ 	MOV64   x1, SCTLR_EL1_DEFAULT
+ 	cmp		x0, x1

@@ -1,0 +1,83 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -359,6 +359,19 @@
+ ARM64_LINK_ADDR    =0xfffffe0007004000
+ endif
+ 
++# sagit (Xiaomi Mi 6, MSM8998) is a 4 KiB-granule board (ID_AA64MMFR0_EL1 =
++# 0x1122: TGran16 = TGran64 = 0) even though it is built on the MacOSX platform
++# and reuses the Qualcomm-generic SWEET board description.  The ARM_LARGE_MEMORY
++# layout above places the kernel at 0xfffffe0007004000, which needs a >41-bit
++# TTBR1 range; with a 4 KiB granule T1SZ_BOOT is 26 (38-bit, sub-page L1), so
++# that layout cannot be reached.  Use the non-large-memory arm64 layout that
++# Apple's own 4 KiB kernels use instead.
++ifeq ($(CURRENT_MACHINE_CONFIG),SAGIT)
++LARGE_MEMORY_DEFINE=
++ARM64_PLKSEG_ADDR  =0xfffffff004004000
++ARM64_LINK_ADDR    =0xfffffff007004000
++endif
++
+ 
+ CFLAGS_ARM64	= -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=$(ARM64_LINK_ADDR) \
+ 			$(LARGE_MEMORY_DEFINE) -momit-leaf-frame-pointer -fno-strict-aliasing -D__API__=v4 -mkernel
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -108,6 +108,15 @@
+ 
+ #endif  /* ARM64_BOARD_CONFIG_SWEET */
+ 
++/*
++ * sagit keeps the ARM64_BOARD_CONFIG_SWEET block above (Qualcomm-generic
++ * platform description, MAX_CPUS etc.) but is a 4 KiB-granule board, so its
++ * header must be included afterwards: it undefines __ARM_16K_PG__.
++ */
++#ifdef ARM64_BOARD_CONFIG_SAGIT
++#include <pexpert/arm64/SAGIT.h>
++#endif  /* ARM64_BOARD_CONFIG_SAGIT */
++
+ #ifdef ARM64_BOARD_CONFIG_VMAPPLE
+ #include <pexpert/arm64/VMAPPLE.h>
+ 
+diff --git a/pexpert/pexpert/arm64/SAGIT.h b/pexpert/pexpert/arm64/SAGIT.h
+--- a/pexpert/pexpert/arm64/SAGIT.h
++++ b/pexpert/pexpert/arm64/SAGIT.h
+@@ -17,9 +17,13 @@
+  *     so the timer and IPIs arrive as Group 1 IRQs through sleh_irq();
+  *   - Qualcomm timer PPI numbering: the virtual timer XNU uses (CNTV) is
+  *     INTID 16 + 3 = 19, IPIs are SGI 1;
+- *   - 16K pages (the boot loader hands the kernel over at EL1 with the MMU
+- *     off; 16K granule is supported), 64-byte cache lines, PSCI CPU_ON, no
+- *     P/E clusters.
++ *   - 4K pages, 64-byte cache lines, PSCI CPU_ON, no P/E clusters.  The SoC
++ *     implements ONLY the 4 KiB granule: ID_AA64MMFR0_EL1 reads 0x1122 on the
++ *     device (read at EL1: PARange=2 / 40-bit PA, TGran4 supported, TGran16=0,
++ *     TGran64=0).  A 16 KiB TCR_EL1.TG0 is not executable there: the first
++ *     fetch after the MMU is enabled takes a translation fault.  QEMU's
++ *     cortex-a53 model reports the same 0x1122 and reproduces that fault, while
++ *     its cortex-a76 model (0x101122, TGran16=1) runs the same 16 KiB kernel.
+  *
+  * Nothing in SWEET.h carries an SoC address - no UART, framebuffer or storage
+  * base - so what genuinely differs on this board is described in the ADT
+@@ -49,7 +53,20 @@
+ 
+ #include <pexpert/arm64/SWEET.h>
+ 
++/*
++ * SWEET.h describes the Qualcomm-generic platform (GICv3 with TrustZone owning
++ * Group 0, architected timer with virtual-timer INTID 19, PSCI CPU_ON) and is
++ * the right description for MSM8998, but it is also a 16 KiB-page board: its
++ * __ARM_16K_PG__ selects the 16 KiB page layout, TCR_EL1.TG0 = 16K and the
++ * 0xfffffe0007004000 KVA layout.  None of that is executable on Kryo 280, so
++ * drop the granule macro and take the 4 KiB geometry Apple uses for its own
++ * 4 KiB arm64 kernels (see BCM2837.h).
++ */
++#undef  __ARM_16K_PG__
++#define __ARM64_PMAP_SUBPAGE_L1__      1
++
+ #define SAGIT                          1
++#define SAGIT_4K_GRANULE               1
+ #define MSM8998                        1
+ 
+ #endif /* ! _PEXPERT_ARM64_SAGIT_H */
