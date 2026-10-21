@@ -33,6 +33,39 @@ VTIMER_INTID = 19
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
+# Per-board values. Every number below was measured on the device or decoded
+# from its stock DTB; see NOTES.md / the device page for provenance.
+MACHINES = {
+    'sweet': dict(
+        gicd=0x17a00000, gicr=0x17a60000,
+        fb=0x9c000000, fb_size=0x1700000, fb_w=1080, fb_h=2400, fb_stride=1080 * 4,
+        ufs=0x01d84000, ufs_size=0x3000,
+        timebase=19200000, vtimer_intid=19,
+        canvas_w=1125, canvas_h=2436,
+        soc=b'qcom,sm7150', cpu_compat=b'qcom,kryo470',
+        cpu_regs=[c << 8 for c in range(8)], big_first=False,
+        big_clk=2304000000, little_clk=1804800000, io=b'sweet-io',
+        phys_base=0xb0000000, mem_size=0x4d000000,
+        high_phys_base=0x100000000, high_mem_size=0xfcc00000,
+    ),
+    # Xiaomi Mi 6 (sagit / MSM8998): 4GB variant. CPU MPIDRs are Aff1:Aff0
+    # (0-3 big, 0x100-0x103 little), not core<<8.
+    'sagit': dict(
+        gicd=0x17a00000, gicr=0x17b00000,
+        fb=0x9d400000, fb_size=0x2400000, fb_w=1080, fb_h=1920, fb_stride=1080 * 4,
+        ufs=0x01da4000, ufs_size=0x14000,
+        timebase=19200000, vtimer_intid=19,
+        canvas_w=1080, canvas_h=1920,
+        soc=b'qcom,msm8998', cpu_compat=b'qcom,kryo280',
+        cpu_regs=[0, 1, 2, 3, 0x100, 0x101, 0x102, 0x103], big_first=True,
+        big_clk=2457600000, little_clk=1900800000, io=b'sagit-io',
+        # Low bank stops below the RPM/secure carve-outs at 0xf6400000+;
+        # the upper bank (0x1_00000000 + 0x7e4c0000) is clean.
+        phys_base=0xb0000000, mem_size=0x46000000,
+        high_phys_base=0x100000000, high_mem_size=0x7e4c0000,
+    ),
+}
+
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
@@ -58,7 +91,7 @@ def d22ap_product(path=D22AP_ADT):
 
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
 u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
-cstr = lambda s: s.encode() + b'\0'
+cstr = lambda s: (s.encode() if isinstance(s, str) else s) + b'\0'
 
 
 def node(name, props=(), children=()):
@@ -68,10 +101,13 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
-    phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
-    gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
+def build(seed=None, qemu=False, highmem=False, machine='sweet'):
+    """machine selects the board; qemu=True swaps in QEMU virt's GIC/CNTFRQ."""
+    m = MACHINES[machine]
+    phys_base, mem_size = ((m['high_phys_base'], m['high_mem_size']) if highmem
+                           else (m['phys_base'], m['mem_size']))
+    gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (m['gicd'], m['gicr'], m['timebase'])
+    vtimer = QEMU_VTIMER_INTID if qemu else m['vtimer_intid']
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
@@ -119,17 +155,17 @@ def build(seed=None, qemu=False, highmem=False):
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # SWEET SMP: all eight cores in physical-core order (0-5 Cortex-A55,
-    # 6-7 Cortex-A76), one homogeneous cluster. The kernel defaults to one
-    # and uses cpus=N to select an initial prefix (N <= 8).
-    # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
+    # All eight cores in physical-core order, one homogeneous cluster. The
+    # kernel defaults to one and uses cpus=N to select an initial prefix.
+    # QEMU retains its original single-CPU tree: its MPIDRs differ.
     cpu_nodes = []
     for core in range(1 if qemu else 8):
+        big = (core < 4) if m['big_first'] else (core >= 6)
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
-            ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+            ('compatible', cstr(m['cpu_compat']) + cstr('ARM,v8')),
+            ('reg', u32(m['cpu_regs'][core])),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
             ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
@@ -139,7 +175,7 @@ def build(seed=None, qemu=False, highmem=False):
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
+            ('clock-frequency', u32(m['big_clk'] if big else m['little_clk'])),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -152,13 +188,13 @@ def build(seed=None, qemu=False, highmem=False):
         ph(),
         ('compatible', cstr('arm,gic-v3')),
         ('interrupt-controller', b''),
-        ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
+        ('virtual-timer-intid', u32(vtimer)),
         ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
     ])
     arm_io = node('arm-io', [
         ph(),
-        ('device_type', cstr('sweet-io')),
-        ('compatible', cstr('sweet-io') + cstr('arm-io')),
+        ('device_type', cstr(m['io'])),
+        ('compatible', cstr(m['io']) + cstr('arm-io')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
         ('ranges', u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
@@ -174,24 +210,24 @@ def build(seed=None, qemu=False, highmem=False):
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),
-            ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(1125)),
-            ('canvas-height', u32(2436)),
+            ('compatible', cstr(machine + ',display')),
+            ('canvas-width', u32(m['canvas_w'])),
+            ('canvas-height', u32(m['canvas_h'])),
         ])])
 
     fbcon = node('sweet-fbcon', [
         ph(),
-        ('reg', u64(FB, FB_SIZE)),
-        ('width', u32(FB_W)),
-        ('height', u32(FB_H)),
-        ('stride', u32(FB_STRIDE)),
+        ('reg', u64(m['fb'], m['fb_size'])),
+        ('width', u32(m['fb_w'])),
+        ('height', u32(m['fb_h'])),
+        ('stride', u32(m['fb_stride'])),
     ])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
     ufs = node('sweet-ufs', [
         ph(),
         ('compatible', cstr('qcom,ufshc')),
-        ('reg', u64(UFS, UFS_SIZE)),
+        ('reg', u64(m['ufs'], m['ufs_size'])),
     ])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
@@ -215,9 +251,15 @@ def build(seed=None, qemu=False, highmem=False):
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
+    compat = [cstr('D22AP'), cstr('iPhone10,3'), cstr('xiaomi,' + machine)]
+    if machine != 'sweet':
+        # SweetPlatformExpert's IONameMatch stays 'xiaomi,sweet'; keep it in
+        # the list so an unmodified kernel matches a new board.
+        compat.append(cstr('xiaomi,sweet'))
+    compat += [cstr(m['soc']), cstr('AppleARM')]
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('compatible', b''.join(compat)),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
@@ -228,7 +270,15 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    machine = 'sweet'
+    for i, a in enumerate(sys.argv):
+        if a == '--machine' and i + 1 < len(sys.argv):
+            machine = sys.argv[i + 1]
+        elif a == '--sagit':
+            machine = 'sagit'
+        elif a == '--polaris':
+            machine = 'sagit'
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, machine=machine)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
