@@ -1,10 +1,11 @@
 diff --git a/pexpert/pexpert/arm64/SAGIT.h b/pexpert/pexpert/arm64/SAGIT.h
 --- a/pexpert/pexpert/arm64/SAGIT.h
 +++ b/pexpert/pexpert/arm64/SAGIT.h
-@@ -64,6 +64,13 @@
+@@ -63,6 +63,14 @@
+  * 4 KiB arm64 kernels (see BCM2837.h).
   */
  #undef  __ARM_16K_PG__
- 
++
 +/*
 + * PAN (Privileged Access Never, the msr PAN instruction) is ARMv8.1.  SWEET.h
 + * enables it for the Cortex-A76/A55 of the Redmi Note 10 Pro; Kryo 280 is

@@ -81,38 +81,14 @@ jobs:
         run: bash build.sh
 
       - name: Verify ARMv8.0 codegen for sagit
-        # Mi 6 (MSM8998, Kryo 280) is an ARMv8.0 core: no LSE atomics (ARMv8.1)
-        # and no LDAPR/RCpc (ARMv8.3).  Any of those instructions in the kernel
-        # is an undefined-instruction panic on the device, so fail the build
-        # instead of discovering it on hardware.
+        # Mi 6 (MSM8998, Kryo 280) is an ARMv8.0 core: no LSE atomics (ARMv8.1),
+        # no LDAPR/RCpc (ARMv8.3), no PAN/UAO.  Any of those in the kernel is an
+        # undefined-instruction panic on the device, so fail the build here.
         if: always()
         run: |
           K=$(ls dxb/fakeroot/System/Library/Kernels/kernel.development.sagit 2>/dev/null || true)
           [ -n "$K" ] || { echo "no kernel to check"; exit 1; }
-          # Xcode's toolchain has no llvm-objdump; otool -tv prints mnemonics too.
-          if LD=$(xcrun --find llvm-objdump 2>/dev/null); then
-            "$LD" -d "$K" > kernel.dis
-          else
-            xcrun otool -tvV "$K" > kernel.dis
-          fi
-          echo "disassembly lines: $(wc -l < kernel.dis)"
-          bad=$(grep -cE '\b(ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|swp|cas)[a-z]*[[:space:]]' kernel.dis || true)
-          rcpc=$(grep -cE '\b(ldapr|stlur|ldapur|stpur)[a-z]*[[:space:]]' kernel.dis || true)
-          pan=$(grep -cE 'msr[[:space:]]+(pan|uao)' kernel.dis || true)
-          echo "LSE atomics: $bad   RCpc/LDAPR: $rcpc   PAN/UAO: $pan   (lines: $(wc -l < kernel.dis))"
-          if [ "$bad" != 0 ] || [ "$rcpc" != 0 ] || [ "$pan" != 0 ]; then
-            echo "::error::kernel contains post-ARMv8.0 instructions; a sagit patch may have been skipped"
-            grep -nE '\b(ldadd|ldclr|ldeor|ldset|swp|cas|ldapr|stlur)[a-z]*[[:space:]]|msr[[:space:]]+(pan|uao)' kernel.dis | head -5
-            exit 1
-          fi
-          # The 4 KiB layout PATCH (0101/0103) must be in effect: a 16 KiB-layout
-          # kernel is linked at 0xfffffe0007004000 instead of 0xfffffff007004000.
-          base=$(otool -l "$K" | awk '/LC_SEGMENT_64/{s=1} s&&/vmaddr/{print $2; exit}')
-          echo "first segment vmaddr: $base"
-          case "$base" in
-            0xfffffff0*) ;;
-            *) echo "::error::kernel is not linked for the 4 KiB layout (patches 0101/0103 missing?)"; exit 1 ;;
-          esac
+          python3 ci/check-armv8.py "$K"
 
       - name: Package build tree for local compiles
         if: always()
