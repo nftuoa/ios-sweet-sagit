@@ -83,7 +83,13 @@ jobs:
         run: |
           K=$(ls dxb/fakeroot/System/Library/Kernels/kernel.development.sagit 2>/dev/null || true)
           [ -n "$K" ] || { echo "no kernel to check"; exit 1; }
-          llvm-objdump -d "$K" > kernel.dis
+          # Xcode's toolchain has no llvm-objdump; otool -tv prints mnemonics too.
+          if LD=$(xcrun --find llvm-objdump 2>/dev/null); then
+            "$LD" -d "$K" > kernel.dis
+          else
+            xcrun otool -tvV "$K" > kernel.dis
+          fi
+          echo "disassembly lines: $(wc -l < kernel.dis)"
           bad=$(grep -cE '\b(ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|swp|cas)[abhl]?[[:space:]]' kernel.dis || true)
           rcpc=$(grep -cE '\b(ldapr|stlur|ldapur|stlur)[abhl]?[[:space:]]' kernel.dis || true)
           echo "LSE atomics: $bad   RCpc/LDAPR: $rcpc   (instructions disassembled: $(wc -l < kernel.dis))"
