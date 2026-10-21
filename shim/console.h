@@ -11,9 +11,15 @@
 #define WHITE	0xffffffffU
 #define YELLOW	0xffffff00U
 #define GREEN	0xff00ff00U
+#define CYAN	0xff00ffffU
+#define MAGENTA	0xffff00ffU
+#define ORANGE	0xffff8000U
+#define PURPLE	0xff8000ffU
+#define GREY	0xff808080U
 
 extern volatile uint32_t *con_fb;
 
+void con_diag(int slot, uint32_t color);
 void con_clear(uint32_t bg);
 void con_skip(void);
 void con_str(const char *label, const char *s);

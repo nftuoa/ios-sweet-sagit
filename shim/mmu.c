@@ -124,6 +124,43 @@ int mmu_enable(struct mmu_info *info)
 	return 0;
 }
 
+/*
+ * Bring-up self test (see mmu.h).  Runs entirely inside the shim, so a result
+ * that says "cannot translate" is a statement about the SoC, not about XNU.
+ */
+int mmu_selftest(int *tbi_ok)
+{
+	struct mmu_info mi;
+	uint64_t tcr;
+
+	*tbi_ok = 0;
+	if (mmu_enable(&mi) != 0)
+		return -1;
+
+	uint64_t par_self = mmu_probe((uintptr_t)mmu_selftest);
+	uint64_t par_fb = mmu_probe(FB_PHYS + 0x1000);
+
+	/* Same configuration with TCR.TBI0 (top byte ignore) set. */
+	tcr = rsr("tcr_el1") | (1UL << 37);
+	wsr("tcr_el1", tcr);
+	__asm__ volatile("isb; tlbi vmalle1; dsb sy; isb" ::: "memory");
+	uint64_t par_tbi = mmu_probe((uintptr_t)mmu_selftest);
+	*tbi_ok = ((par_tbi & 1) == 0);
+
+	wsr("tcr_el1", tcr & ~(1UL << 37));
+	__asm__ volatile("isb; tlbi vmalle1; dsb sy; isb" ::: "memory");
+
+	/* MMU and caches off again for the XNU handoff (ABL left them off). */
+	uint64_t sctlr = rsr("sctlr_el1");
+	sctlr &= ~(SCTLR_M | SCTLR_C | SCTLR_I);
+	wsr("sctlr_el1", sctlr);
+	__asm__ volatile("isb; tlbi vmalle1; ic iallu; dsb sy; isb" ::: "memory");
+
+	if ((par_self & 1) || (par_fb & 1))
+		return -1;
+	return 0;
+}
+
 /* Translate a VA with AT S1E1R; returns PAR_EL1. */
 uint64_t mmu_probe(uintptr_t va)
 {

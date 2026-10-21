@@ -11,6 +11,7 @@
 #include "console.h"
 #include "fdt.h"
 #include "loader.h"
+#include "mmu.h"
 
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
@@ -80,6 +81,9 @@ const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
 
+	/* DIAG slot 3 (cyan): loader_boot entered - shim_main ran. */
+	con_diag(3, CYAN);
+
 	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
 	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
 		return "no initrd in /chosen";
@@ -90,6 +94,9 @@ const char *loader_boot(uintptr_t dtb)
 		return "no SWEETXNU payload";
 	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
 		return "bad payload header";
+
+	/* DIAG slot 4 (magenta): SWEETXNU payload found and validated. */
+	con_diag(4, MAGENTA);
 
 	uint64_t pa_of_va_base = p->phys_base - p->virt_base;	/* pa = va + this */
 	con_hex2("PHYS", "base=", p->phys_base, "size=", p->mem_size);
@@ -135,6 +142,25 @@ const char *loader_boot(uintptr_t dtb)
 		ba->CommandLine[i] = p->cmdline[i];
 	ba->memSizeActual = p->mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
+
+	/* DIAG slot 5 (white): kernel, ADT and boot_args are in place. */
+	con_diag(5, WHITE);
+
+	/*
+	 * DIAG slots 6/7: can this SoC actually run the 16K-granule XNU?
+	 *   slot 7 green  = the 16K MMU enables and translates (granule usable)
+	 *   slot 7 red    = enabling it faults (16K unusable: A53/A57/QEMU agree)
+	 *   slot 6 purple = TCR.TBI0 also translates
+	 *   slot 6 grey   = setting TCR.TBI0 breaks translation
+	 */
+	con_diag(6, ORANGE);
+	int tbi_ok = 0;
+	if (mmu_selftest(&tbi_ok) == 0) {
+		con_diag(7, GREEN);
+		con_diag(6, tbi_ok ? PURPLE : GREY);
+	} else {
+		con_diag(7, RED);
+	}
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
 	con_hex("JUMP", entry_pa);

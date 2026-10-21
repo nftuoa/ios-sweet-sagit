@@ -15,6 +15,21 @@ volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
 static uint32_t con_bg;
 static int row;
 
+/*
+ * Bring-up diagnosis: a 96x96 solid square, slot 0..7 along the top edge.
+ * Drawn with the MMU off, so it needs no page tables and no console state.
+ */
+void con_diag(int slot, uint32_t color)
+{
+	unsigned x0 = 8u + (unsigned)slot * 128u, y0 = 8u;
+	for (unsigned y = 0; y < 96; y++) {
+		volatile uint32_t *line = con_fb + (y0 + y) * (FB_STRIDE / 4);
+		for (unsigned x = 0; x < 96; x++)
+			line[x0 + x] = color;
+	}
+	__sync_synchronize();
+}
+
 void con_clear(uint32_t bg)
 {
 	for (int y = 0; y < FB_H; y++) {

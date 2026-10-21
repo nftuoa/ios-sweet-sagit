@@ -21,6 +21,24 @@ _head:
 _start:
 	msr	daifset, #0xf
 	mov	x19, x0			/* DTB pointer from ABL */
+	/*
+	 * DIAG slot 0 (green): proves ABL jumped into this image.  No stack, no
+	 * globals, no page tables - only absolute FB writes.
+	 */
+	movz	x9, #0x9d40, lsl #16		/* 0x9d400000: ABL splash FB */
+	mov	x10, #(8 * 4320 + 8 * 4)
+	add	x9, x9, x10
+	mov	w12, #0xff00ff00
+	mov	x14, #4320
+	mov	x10, #96
+5:	mov	x11, #96
+	mov	x13, x9
+6:	str	w12, [x13], #4
+	subs	x11, x11, #1
+	b.ne	6b
+	add	x9, x9, x14
+	subs	x10, x10, #1
+	b.ne	5b
 	msr	spsel, #1
 	adr	x1, _stack_top
 	mov	sp, x1
@@ -34,7 +52,12 @@ _start:
 	b.hs	2f
 	str	xzr, [x1], #8
 	b	1b
-2:	mov	x0, x19
+2:
+	/* DIAG slot 1 (blue): stack set up, .bss cleared, about to call C. */
+	mov	x0, #1
+	mov	w1, #0xff0000ff
+	bl	con_diag
+	mov	x0, x19
 	bl	shim_main
 3:	wfe
 	b	3b
