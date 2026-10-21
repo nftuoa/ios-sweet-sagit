@@ -2,6 +2,9 @@
 # dxb runs patches/*.sh from the XNU source root before applying *.patch.
 set -euo pipefail
 
+# SAGIT is compiled as a SWEET variant (see pexpert/arm64/SAGIT.h), so it
+# needs this staged too. Overlay of the ios-sweet 00NN script: copy this
+# file into dxb/patches AFTER ios-sweet/xnu/patches so it wins by name.
 case "${MACHINE_CONFIG:-}" in SWEET|SAGIT) ;; *) exit 0 ;; esac
 [[ "${MACOS_VERSION:-}" == 13.5 ]] || {
     echo 'SWEET libpthread integration requires xnu-8796.141.3 (macOS 13.5)' >&2

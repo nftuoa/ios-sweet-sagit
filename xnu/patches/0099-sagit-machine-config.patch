@@ -1,0 +1,135 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 9a748ea..4524d3e 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -29,7 +29,7 @@ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else ifneq ($(findstring _host,$(RC_ProjectName)),)
+ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else
+-SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET
++SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET SAGIT
+ 
+ endif
+ 
+@@ -62,6 +62,21 @@ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+ MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
++# sagit (Xiaomi Mi 6, Qualcomm MSM8998 / Snapdragon 835) is built as a sweet
++# variant: every #ifdef guarded by ARM64_BOARD_CONFIG_SWEET is Qualcomm-generic
++# - GICv3 with TrustZone owning Group 0 (everything arrives as Group 1 IRQs via
++# sleh_irq), architected timer with virtual-timer INTID 19, 16K pages, PSCI
++# CPU_ON - and SWEET.h itself carries no SoC address at all. What really differs
++# (framebuffer 0x9d400000/0x2400000 1080x1920, GICR 0x17b00000, UFSHC 0x1da4000,
++# "memory" 0x80000000+0xFE4C0000) lives in the ADT device tree, not in the
++# kernel. Defining SWEET too keeps declaration and use sites in sync (protos.h
++# declares sweet_vtimer_intid under ARM64_BOARD_CONFIG_SWEET while sleh.c uses
++# it under plain SWEET, which SWEET.h provides).
++#
++# -march: Kryo 280 (Cortex-A73/A53 class, MIDR 0x51AF8014) is ARMv8.0 with the
++# optional crypto extension. armv8.2-a would let clang emit instructions this
++# core does not implement, so this must stay armv8-a+crypto.
++MACHINE_FLAGS_ARM64_SAGIT = -DARM64_BOARD_CONFIG_SAGIT -DARM64_BOARD_CONFIG_SWEET -march=armv8-a+crypto
+ 
+ 
+ #
+@@ -240,6 +255,12 @@ else ifneq ($(findstring _host,$(RC_ProjectName)),)
+ ARCH_FLAGS_ARM64          = -arch arm64e
+ else
+ 
++# sagit has no pointer authentication: force plain arm64 before the ?= default.
++
++ifeq ($(CURRENT_MACHINE_CONFIG),SAGIT)
++override ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64
++endif
++
+ ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG ?=
+ 
+ ifeq ($(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG),)
+@@ -260,8 +281,9 @@ ifeq ($(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG),)
+ # Without embdedded device map, use a default arch string
+ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := $(shell echo $(CURRENT_ARCH_CONFIG) | tr A-Z a-z)
+ ifneq ($(filter arm64,$(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)),)
+-# sweet's Cortex-A76/A55 have no pointer authentication: stay plain arm64
+-ifneq ($(CURRENT_MACHINE_CONFIG),SWEET)
++# sweet's Cortex-A76/A55 and sagit's Kryo 280 have no pointer authentication:
++# stay plain arm64
++ifneq ($(filter SWEET SAGIT,$(CURRENT_MACHINE_CONFIG)),)
+ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64e
+ endif
+ endif
+diff --git a/pexpert/pexpert/arm64/Makefile b/pexpert/pexpert/arm64/Makefile
+index c7d274f..b2776a7 100644
+--- a/pexpert/pexpert/arm64/Makefile
++++ b/pexpert/pexpert/arm64/Makefile
+@@ -18,7 +18,8 @@ PRIVATE_KERNELFILES = \
+ 	H13.h \
+ 	VMAPPLE.h \
+ 	BCM2837.h \
+-	SWEET.h
++	SWEET.h \
++	SAGIT.h
+ 
+ 
+ # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
+diff --git a/pexpert/pexpert/arm64/SAGIT.h b/pexpert/pexpert/arm64/SAGIT.h
+new file mode 100644
+index 0000000..ba5c6ed
+--- /dev/null
++++ b/pexpert/pexpert/arm64/SAGIT.h
+@@ -0,0 +1,55 @@
++/*
++ * Board config for the Xiaomi Mi 6 ("sagit", Qualcomm MSM8998 / Snapdragon
++ * 835): Kryo 280 = 4x Cortex-A73 (gold) + 4x Cortex-A53 (silver), ARMv8.0
++ * with the optional crypto extension, no pointer authentication.
++ *
++ * There is deliberately almost nothing here. This target is compiled with both
++ * ARM64_BOARD_CONFIG_SAGIT and ARM64_BOARD_CONFIG_SWEET (see
++ * MACHINE_FLAGS_ARM64_SAGIT in makedefs/MakeInc.def), so
++ * pexpert/arm64/SWEET.h supplies the platform description. That is correct for
++ * MSM8998, not a shortcut: everything SWEET.h describes is shared Qualcomm
++ * plumbing rather than board-specific detail -
++ *   - generic ARM core like BCM2837: no APPLE_ARM64_ARCH_FAMILY, so none of
++ *     Apple's implementation-defined system registers are touched;
++ *   - ARMv8.0 cores without pointer authentication (MIDR 0x51AF8014) -> the
++ *     kernel stays plain arm64 rather than arm64e;
++ *   - GICv3 with two security states (SecurityExtn=1): TrustZone owns Group 0,
++ *     so the timer and IPIs arrive as Group 1 IRQs through sleh_irq();
++ *   - Qualcomm timer PPI numbering: the virtual timer XNU uses (CNTV) is
++ *     INTID 16 + 3 = 19, IPIs are SGI 1;
++ *   - 16K pages (the boot loader hands the kernel over at EL1 with the MMU
++ *     off; 16K granule is supported), 64-byte cache lines, PSCI CPU_ON, no
++ *     P/E clusters.
++ *
++ * Nothing in SWEET.h carries an SoC address - no UART, framebuffer or storage
++ * base - so what genuinely differs on this board is described in the ADT
++ * device tree that tools/mkadt.py builds and the shim hands to the kernel:
++ *   - framebuffer  cont_splash_region 0x9d400000, size 0x2400000
++ *                  (1080 x 1920, splash stride 4320; sweet uses
++ *                  0x9c000000 / 0x1700000)
++ *   - GIC          distributor 0x17a00000, redistributor 0x17b00000
++ *                  (sweet uses 0x17a00000 / 0x17a60000)
++ *   - UFS          ufshc@1da4000 (sweet uses 0x1d84000, aperture 0x2500)
++ *   - timer        19.2 MHz, virtual timer INTID 19
++ *   - memory       0x80000000 + 0xFE4C0000 (4 GB model), high 4G window
++ *                  0x1_00000000 + 0x7E4C0000
++ *   - CPU MPIDRs  0x0 0x1 0x2 0x3 0x100 0x101 0x102 0x103 (the DT
++ *                  "cluster-core-id" properties supply this mapping; it is not
++ *                  core << 8)
++ *
++ * The MAX_* values come from the ARM64_BOARD_CONFIG_SWEET block in
++ * board_config.h and suit MSM8998 unchanged for a first boot: 8 cores exposed
++ * as one homogeneous cluster (the A73s are cores 0-3, but the scheduler is not
++ * told they are faster, exactly like sweet). Adding a SAGIT block there as well
++ * would just redefine them, since both macros are set.
++ */
++
++#ifndef _PEXPERT_ARM64_SAGIT_H
++#define _PEXPERT_ARM64_SAGIT_H
++
++#include <pexpert/arm64/SWEET.h>
++
++#define SAGIT                          1
++#define MSM8998                        1
++
++#endif /* ! _PEXPERT_ARM64_SAGIT_H */

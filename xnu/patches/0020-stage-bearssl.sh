@@ -1,6 +1,9 @@
 #!/bin/bash
 # Pinned, portable constant-time AES for the SWEET legacy CBC/ECB API.
 set -euo pipefail
+# SAGIT is compiled as a SWEET variant (see pexpert/arm64/SAGIT.h), so it
+# needs this staged too. Overlay of the ios-sweet 00NN script: copy this
+# file into dxb/patches AFTER ios-sweet/xnu/patches so it wins by name.
 case "${MACHINE_CONFIG:-}" in SWEET|SAGIT) ;; *) exit 0 ;; esac
 [[ -f libkern/crypto/corecrypto_aes.c ]] || exit 1
 bearssl_sha=7bea48e5e850ab4cafbe68d3765cdaba13a86d6f
