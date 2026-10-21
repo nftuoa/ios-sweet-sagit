@@ -49,8 +49,12 @@ jobs:
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
-          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
-          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # libfirehose_kernel is built arm64e-only by dxb; the SWEET/SAGIT kernel is
+          # plain arm64 and the Mi 6 is ARMv8.0, so build just the arm64 slice with
+          # the v8.0 feature set (no LSE atomics, no RCpc) - otherwise libfirehose's
+          # atomics panic on the device with an undefined instruction.
+          sed -i '' 's|ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"|ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-march=armv8-a -Xclang -target-feature -Xclang -lse -Xclang -target-feature -Xclang -rcpc"|' dxb/build.sh
+          grep -c 'ARCHS="arm64"' dxb/build.sh
           ls dxb/patches
 
       - name: Deps
