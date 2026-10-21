@@ -52,7 +52,9 @@ def main():
     hits = {name: [] for name, _ in BAD}
     total = 0
     for line in dis.splitlines():
-        m = re.match(r'^([0-9a-f]{8,16})\t', line)
+        # otool prints "<addr>\t<encoding>\t<mnemonic> <operands>"; newer builds
+        # pad the address with spaces and may prefix arm64e pointers with '+'.
+        m = re.match(r'^\s*\+?([0-9a-fA-F]{8,16})\s', line)
         if not m:
             continue
         total += 1
@@ -62,6 +64,9 @@ def main():
         for name, pattern in BAD:
             if pattern.search(line):
                 hits[name].append(line.strip())
+    if total == 0:
+        print('error: could not parse the disassembly (otool format changed?)')
+        return 1
     print(f'scanned {total} instructions; hibernation range: '
           f'{hex(skip[0]) + "-" + hex(skip[1]) if skip else "none"}')
     base = first_segment_base(kernel)
