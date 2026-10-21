@@ -82,7 +82,9 @@ const char *loader_boot(uintptr_t dtb)
 	uint64_t rd_start, rd_end;
 
 	/* DIAG slot 3 (cyan): loader_boot entered - shim_main ran. */
+	#if SHIM_DIAG
 	con_diag(3, CYAN);
+#endif
 
 	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
 	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
@@ -96,7 +98,9 @@ const char *loader_boot(uintptr_t dtb)
 		return "bad payload header";
 
 	/* DIAG slot 4 (magenta): SWEETXNU payload found and validated. */
+	#if SHIM_DIAG
 	con_diag(4, MAGENTA);
+#endif
 
 	uint64_t pa_of_va_base = p->phys_base - p->virt_base;	/* pa = va + this */
 	con_hex2("PHYS", "base=", p->phys_base, "size=", p->mem_size);
@@ -144,7 +148,9 @@ const char *loader_boot(uintptr_t dtb)
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
 	/* DIAG slot 5 (white): kernel, ADT and boot_args are in place. */
+	#if SHIM_DIAG
 	con_diag(5, WHITE);
+#endif
 
 	/*
 	 * DIAG slots 6/7: can this SoC actually run the 16K-granule XNU?
@@ -153,6 +159,7 @@ const char *loader_boot(uintptr_t dtb)
 	 *   slot 6 purple = TCR.TBI0 also translates
 	 *   slot 6 grey   = setting TCR.TBI0 breaks translation
 	 */
+#if SHIM_DIAG
 	con_diag(6, ORANGE);
 	int tbi_ok = 0;
 	if (mmu_selftest(&tbi_ok) == 0) {
@@ -161,6 +168,7 @@ const char *loader_boot(uintptr_t dtb)
 	} else {
 		con_diag(7, RED);
 	}
+#endif
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
 	con_hex("JUMP", entry_pa);

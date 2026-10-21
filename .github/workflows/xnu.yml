@@ -74,6 +74,25 @@ jobs:
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: bash build.sh
 
+      - name: Verify ARMv8.0 codegen for sagit
+        # Mi 6 (MSM8998, Kryo 280) is an ARMv8.0 core: no LSE atomics (ARMv8.1)
+        # and no LDAPR/RCpc (ARMv8.3).  Any of those instructions in the kernel
+        # is an undefined-instruction panic on the device, so fail the build
+        # instead of discovering it on hardware.
+        if: always()
+        run: |
+          K=$(ls dxb/fakeroot/System/Library/Kernels/kernel.development.sagit 2>/dev/null || true)
+          [ -n "$K" ] || { echo "no kernel to check"; exit 1; }
+          llvm-objdump -d "$K" > kernel.dis
+          bad=$(grep -cE '\b(ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|swp|cas)[abhl]?[[:space:]]' kernel.dis || true)
+          rcpc=$(grep -cE '\b(ldapr|stlur|ldapur|stlur)[abhl]?[[:space:]]' kernel.dis || true)
+          echo "LSE atomics: $bad   RCpc/LDAPR: $rcpc   (instructions disassembled: $(wc -l < kernel.dis))"
+          if [ "$bad" != 0 ] || [ "$rcpc" != 0 ]; then
+            echo "::error::kernel contains post-ARMv8.0 instructions; fix the SAGIT codegen flags"
+            grep -nE '\b(ldadd|ldclr|ldeor|ldset|swp|cas|ldapr|stlur)[abhl]?[[:space:]]' kernel.dis | head -5
+            exit 1
+          fi
+
       - name: Package build tree for local compiles
         if: always()
         run: |

@@ -1,0 +1,22 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -395,8 +395,18 @@
+ CFLAGS_DEBUGARM = -O0
+ CFLAGS_PROFILEARM = -O2
+ 
++ifeq ($(CURRENT_MACHINE_CONFIG),SAGIT)
++# Kryo 280 (Cortex-A73/A53) is an ARMv8.0 implementation: it has no LSE atomics
++# (ARMv8.1) and no LDAPR (ARMv8.3).  -march in MACHINE_FLAGS is emitted before
++# -arch arm64, where Apple's driver discards it in favour of its Darwin target
++# default (which enables LSE); these flags come after ARCH_FLAGS, so the
++# compiler really has to honour the v8.0 feature set.
++CFLAGS_RELEASEARM64 = -O2 -march=armv8-a+crypto -mno-outline-atomics -Xclang -target-feature -Xclang -lse -Xclang -target-feature -Xclang -rcpc
++CFLAGS_DEVELOPMENTARM64 = -O2 -march=armv8-a+crypto -mno-outline-atomics -Xclang -target-feature -Xclang -lse -Xclang -target-feature -Xclang -rcpc
++else
+ CFLAGS_RELEASEARM64 = -O2
+ CFLAGS_DEVELOPMENTARM64 = -O2
++endif
+ CFLAGS_KASANARM64 = $(CFLAGS_DEVELOPMENTARM64)
+ CFLAGS_DEBUGARM64 = -O0
+ CFLAGS_PROFILEARM64 = -O2

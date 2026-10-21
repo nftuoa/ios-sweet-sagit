@@ -374,8 +374,10 @@ void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
 
+#if SHIM_DIAG
 	/* DIAG slot 2 (yellow): C entry reached, stack and .bss are usable. */
 	con_diag(2, YELLOW);
+#endif
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
