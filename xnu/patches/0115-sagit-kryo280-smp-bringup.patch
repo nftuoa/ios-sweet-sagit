@@ -1,0 +1,79 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..b91f345 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -73,16 +73,35 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SAGIT)
++	/*
++	 * MSM8998: MPIDR is Aff1:Aff0 with Aff1 = cluster (0 = the four Kryo 280
++	 * "big" cores, 1 = the four A53 "little" ones) and Aff0 = core in that
++	 * cluster, so the eight valid IDs are 0x000-0x003 and 0x100-0x103. The
++	 * ADT lists them in exactly that order.
++	 */
++	const uint32_t cluster = (cpu->phys_id >> 8) & 0xff;
++	const uint32_t core = cpu->phys_id & 0xff;
++	if (cluster > 1 || core > 3 || topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
++		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
++	}
++#else
+ 	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+ 	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
++#endif
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SAGIT)
++	cpuName = OSSymbol::withCStringNoCopy("Kryo 280");
++#else
+ 	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++#endif
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+@@ -234,10 +253,20 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ {
+ 	const ml_topology_cpu_t *cpu = &ml_get_topology_info()->cpus[getCPUNumber()];
+ 	/* cpu_start() passes NULL,NULL: x20/x21 are set by LowResetVectorBase. */
+-	if (start_paddr != 0 || arg_paddr != 0 || cpu->phys_id == 0 ||
++	if (start_paddr != 0 || arg_paddr != 0 ||
+ 	    __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 0) {
+ 		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
++	if (cpu->phys_id == 0) {
++		/*
++		 * The boot CPU is the one running this code: cpu_start() calls
++		 * cpu_machine_init() -> initCPU(true) directly for it, so there is
++		 * nothing to release and no PSCI CPU_ON to issue (as AppleARMSMP's
++		 * PE_cpu_start skips boot_cpu). Returning KERN_SUCCESS is what makes
++		 * processor_start() on CPU 0 converge.
++		 */
++		return KERN_SUCCESS;
++	}
+ 	vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
+ 	IOLog("SWEET CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..7df7a06 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -44,7 +44,12 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = SweetCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
++#if defined(ARM64_BOARD_CONFIG_SAGIT)
++    /* MSM8998 (Mi 6) CPU nodes; the SM7150 board says kryo470. */
++    "     'IONameMatch'     = 'qcom,kryo280';"
++#else
+     "     'IONameMatch'     = 'qcom,kryo470';"
++#endif
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
