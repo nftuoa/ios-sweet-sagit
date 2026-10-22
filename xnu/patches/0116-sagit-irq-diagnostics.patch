@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index b91f345..56663b4 100644
+index b91f345..bc35101 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
 @@ -167,16 +167,66 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
@@ -35,14 +35,14 @@ index b91f345..56663b4 100644
 +
 +		frq = __builtin_arm_rsr64("CNTFRQ_EL0");
 +		__builtin_arm_wsr64("CNTV_TVAL_EL0", frq / 100); /* 10 ms */
-+		__builtin_arm_wsr64("CNTV_CTL_EL1", 1);          /* ENABLE, IMASK=0 */
++		__builtin_arm_wsr64("CNTV_CTL_EL0", 1);          /* ENABLE, IMASK=0 */
 +		__builtin_arm_isb(ISB_SY);
 +		lim = __builtin_arm_rsr64("CNTPCT_EL0") + frq / 20; /* 50 ms */
 +		t0 = sweet_irq_counts[0];
 +		while (__builtin_arm_rsr64("CNTPCT_EL0") < lim) {
 +			__builtin_arm_isb(ISB_SY);
 +		}
-+		ctl = __builtin_arm_rsr64("CNTV_CTL_EL1");
++		ctl = __builtin_arm_rsr64("CNTV_CTL_EL0");
 +		kprintf("SWEET CPU: vtimer test: ctl=%#llx ISTATUS=%llu timer irqs=%u\n",
 +		    ctl, (ctl >> 2) & 1, sweet_irq_counts[0] - t0);
 +		kprintf("SWEET CPU: SGI1 pending=%u (0 = already cleared)\n",
@@ -137,7 +137,7 @@ index 24f1abc..409388b 100644
  		if (cdp->interrupt_handler) {
  			cdp->interrupt_handler(cdp->interrupt_target,
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index 6089db9..f613ee5 100644
+index 6089db9..1a23b30 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
 @@ -20,6 +20,9 @@ MACHINE_TIMEOUT(gicr_wake_timeout_ns, "gicr-wake-timeout", GICR_WAKE_TIMEOUT_NS,
@@ -158,7 +158,7 @@ index 6089db9..f613ee5 100644
  #else
  	// Enable the forwarding of the vtimer interrupt
  	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
-@@ -222,6 +226,37 @@ pe_init_fiq()
+@@ -222,6 +226,39 @@ pe_init_fiq()
  	__builtin_arm_isb(ISB_SY);
  #endif /* SWEET */
  }
@@ -169,6 +169,8 @@ index 6089db9..f613ee5 100644
 + * interrupt, plus the interrupt counters kept in sleh.c. Called from IOKit
 + * after the console is up, so the values show up in the boot log.
 + */
++void sweet_gic_dump(const char *where);
++
 +void
 +sweet_gic_dump(const char *where)
 +{
@@ -183,13 +185,13 @@ index 6089db9..f613ee5 100644
 +	    __builtin_arm_rsr64("ICC_IGRPEN1_EL1"));
 +	kprintf("SWEET GIC[%s]: GICD_CTLR=%#x GICR_pe=%p CTLR=%#x ISENABLER0=%#x IGROUPR0=%#x TYPER=%#llx\n",
 +	    where, gicd_base ? gicd_read32(GICD_CTLR) : 0, (void *)sweet_gicr_pe,
-+	    ctl,
++	    (uint32_t)ctl,
 +	    sweet_gicr_pe ? _gic_read32(sweet_gicr_pe + GICR_ISENABLER0) : 0,
 +	    sweet_gicr_pe ? _gic_read32(sweet_gicr_pe + GICR_IGROUPR0) : 0,
 +	    sweet_gicr_pe ? _gic_read64(sweet_gicr_pe + GICR_TYPER) : 0);
 +	kprintf("SWEET GIC[%s]: cntfrq=%llu cntpct=%llu cntv_ctl=%#llx cntv_tval=%#llx\n",
 +	    where, __builtin_arm_rsr64("CNTFRQ_EL0"),
-+	    __builtin_arm_rsr64("CNTPCT_EL0"), __builtin_arm_rsr64("CNTV_CTL_EL1"),
++	    __builtin_arm_rsr64("CNTPCT_EL0"), __builtin_arm_rsr64("CNTV_CTL_EL0"),
 +	    __builtin_arm_rsr64("CNTV_TVAL_EL0"));
 +}
 +#endif /* SWEET */
