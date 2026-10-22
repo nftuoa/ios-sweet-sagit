@@ -1,0 +1,42 @@
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index 182b44a..2d9f4ef 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -160,10 +160,15 @@ ZONE_DEFINE_TYPE(percpu_u64_zone, "percpu.64", uint64_t,
+ #define ZONE_GUARD_SPARSE       (64  * 1024)
+ #endif /* ZSECURITY_CONFIG(SAD_FENG_SHUI) */
+ 
+-#if XNU_PLATFORM_MacOSX
++#if XNU_PLATFORM_MacOSX && !defined(ARM64_BOARD_CONFIG_SAGIT)
+ #define ZONE_MAP_MAX            (32ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+ #else /* XNU_PLATFORM_MacOSX */
++/*
++ * sagit is a 4 KiB-granule board built with the iOS-shaped KVA layout, whose
++ * kernel map is only about 112 GiB: the 128 GiB macOS zone map cannot be
++ * reserved there.  Use the iOS sizing (24 GiB), which is ample for 4 GiB RAM.
++ */
+ #define ZONE_MAP_MAX            (8ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (24ULL << 30)
+ #endif /* !XNU_PLATFORM_MacOSX */
+diff --git a/osfmk/vm/vm_compressor.c b/osfmk/vm/vm_compressor.c
+index 1e7ca07..dbd3252 100644
+--- a/osfmk/vm/vm_compressor.c
++++ b/osfmk/vm/vm_compressor.c
+@@ -824,6 +824,16 @@ vm_compressor_set_size(void)
+ 			compressor_pool_size = 2ULL * max_mem;
+ 		}
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SAGIT)
++	/*
++	 * The iOS-shaped kernel map on this 4 KiB-granule board is about 112 GiB,
++	 * so the macOS 16x-RAM compressor pool cannot be reserved.  Cap it at the
++	 * iOS-like 4x RAM (8 GiB on the 4 GiB Mi 6).
++	 */
++	if (compressor_pool_size > (4ULL * max_mem)) {
++		compressor_pool_size = 4ULL * max_mem;
++	}
++#endif
+ 	/*
+ 	 * Cap the compressor pool size to a max of 192G
+ 	 */
