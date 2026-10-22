@@ -1,0 +1,90 @@
+diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
+index 7a32a23..69917f9 100644
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -2130,7 +2130,9 @@ IOPlatformExpertDevice::free()
+ void
+ IOPlatformExpertDevice::configureDefaults( void )
+ {
++	kprintf("IOKDBG: createNVRAM\n");
+ 	createNVRAM();
++	kprintf("IOKDBG: createNVRAM done\n");
+ 	// Parse the serial-number data and publish a user-readable string
+ 	OSData* mydata = (OSData*) (getProperty("serial-number"));
+ 	if (mydata != NULL) {
+@@ -2140,7 +2142,9 @@ IOPlatformExpertDevice::configureDefaults( void )
+ 			serNoString->release();
+ 		}
+ 	}
++	kprintf("IOKDBG: generatePlatformUUID\n");
+ 	generatePlatformUUID();
++	kprintf("IOKDBG: generatePlatformUUID done\n");
+ }
+ 
+ void
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index d74c063..de7cc57 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -143,29 +143,39 @@ InitIOKit(void *dtTop)
+ 	// of iokit basic service initialisation, or better we have IOLib stuff
+ 	// initialise as basic OS services.
+ 	//
++	kprintf("IOKDBG: IOLibInit\n");
+ 	IOLibInit();
++	kprintf("IOKDBG: OSlibkernInit\n");
+ 	OSlibkernInit();
++	kprintf("IOKDBG: IOMachPortInitialize\n");
+ 	IOMachPortInitialize();
++	kprintf("IOKDBG: root nub\n");
+ 
+ 	gIOProgressBackbufferKey  = OSSymbol::withCStringNoCopy(kIOProgressBackbufferKey);
+ 	gIORemoveOnReadProperties = OSSet::withObjects((const OSObject **) &gIOProgressBackbufferKey, 1);
+ 
+ 	interruptAccountingInit();
+ 
++	kprintf("IOKDBG: IOPlatformExpertDevice alloc\n");
+ 	gRootNub = new IOPlatformExpertDevice;
+ 	if (__improbable(gRootNub == NULL)) {
+ 		panic("Failed to allocate IOKit root nub");
+ 	}
++	kprintf("IOKDBG: root nub init\n");
+ 	bool ok = gRootNub->init(dtTop);
++	kprintf("IOKDBG: root nub init -> %d\n", (int)ok);
+ 	if (__improbable(!ok)) {
+ 		panic("Failed to initialize IOKit root nub");
+ 	}
++	kprintf("IOKDBG: root nub attach\n");
+ 	gRootNub->attach(NULL);
++	kprintf("IOKDBG: root nub attached\n");
+ 
+ 	/* If the bootstrap segment set up a function to record startup
+ 	 * extensions, call it now.
+ 	 */
+ 	if (record_startup_extensions_function) {
++			kprintf("IOKDBG: record_startup_extensions\n");
+ 		record_startup_extensions_function();
+ 	}
+ }
+@@ -174,7 +184,9 @@ void
+ ConfigureIOKit(void)
+ {
+ 	assert(gRootNub != NULL);
++	kprintf("IOKDBG: configureDefaults\n");
+ 	gRootNub->configureDefaults();
++	kprintf("IOKDBG: configureDefaults done\n");
+ }
+ 
+ void
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index bec97fb..2b2c464 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -687,6 +687,7 @@ kernel_bootstrap_thread(void)
+ #ifdef  IOKIT
+ 	kernel_bootstrap_log("PE_init_iokit");
+ 	PE_init_iokit();
++	kprintf("IOKDBG: PE_init_iokit returned\n");
+ #endif
+ 
+ 	assert(ml_get_interrupts_enabled() == FALSE);
