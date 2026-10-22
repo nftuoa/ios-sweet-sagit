@@ -1,8 +1,20 @@
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index b91f345..bc35101 100644
+index b91f345..eb31631 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
-@@ -167,16 +167,66 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -20,6 +20,11 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++#if defined(SWEET)
++/* C++ callers must match the C linkage of these pe_fiq.c/sleh.c symbols. */
++extern "C" void sweet_gic_dump(const char *where);
++extern "C" volatile uint32_t sweet_irq_counts[3];
++#endif
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -167,16 +172,64 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
  		panic("SWEET CPU: expected boot MPIDR 0 and logical CPU 0");
  	}
@@ -15,8 +27,6 @@ index b91f345..bc35101 100644
 +	 * shows whether the timer PPI reaches sleh_irq().
 +	 */
 +	{
-+		extern void sweet_gic_dump(const char *where);
-+		extern volatile uint32_t sweet_irq_counts[3];
 +		uint64_t t_deadline;
 +		uint32_t t0, i0, o0;
 +		uint64_t frq, lim, ctl;
@@ -71,7 +81,7 @@ index b91f345..bc35101 100644
  			if (mach_absolute_time() > deadline) {
  				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
  				    i, topology->cpus[i].phys_id);
-@@ -184,16 +234,17 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -184,16 +237,17 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  			}
  			IOSleep(1);
  		}
