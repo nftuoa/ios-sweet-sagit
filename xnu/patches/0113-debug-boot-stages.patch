@@ -1,0 +1,46 @@
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -762,33 +762,42 @@
+ 
+ #ifdef CONFIG_XNUPOST
+ 	kern_return_t result = kernel_list_tests();
++	kprintf("BOOTDBG: kernel_do_post enter\n");
+ 	result = kernel_do_post();
++	kprintf("BOOTDBG: kernel_do_post returned %d\n", result);
+ 	if (result != KERN_SUCCESS) {
+ 		panic("kernel_do_post: Tests failed with result = 0x%08x", result);
+ 	}
+ 	kernel_bootstrap_log("kernel_do_post - done");
++	kprintf("BOOTDBG: do_post logged\n");
+ #endif /* CONFIG_XNUPOST */
+ 
+ #ifdef  IOKIT
+ 	kernel_bootstrap_log("PE_lockdown_iokit");
+ 	PE_lockdown_iokit();
++	kprintf("BOOTDBG: PE_lockdown_iokit done\n");
+ #endif
+ 	/*
+ 	 * max_cpus must be nailed down by the time PE_lockdown_iokit() finishes,
+ 	 * at the latest
+ 	 */
+ 	vm_set_restrictions(machine_info.max_cpus);
++	kprintf("BOOTDBG: vm_set_restrictions done\n");
+ 
+ 
+ #if KPERF
++	kprintf("BOOTDBG: kperf_init_early\n");
+ 	kperf_init_early();
++	kprintf("BOOTDBG: kperf_init_early done\n");
+ #endif
+ 
+ 	/*
+ 	 *	Start the user bootstrap.
+ 	 */
+ #ifdef  MACH_BSD
++	kprintf("BOOTDBG: bsd_init enter\n");
+ 	bsd_init();
++	kprintf("BOOTDBG: bsd_init returned\n");
+ #endif
+ 
+ 
