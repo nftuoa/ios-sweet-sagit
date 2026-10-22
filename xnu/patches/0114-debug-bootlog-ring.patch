@@ -1,0 +1,29 @@
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index c86b9e7..81074c5 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -615,9 +615,24 @@ console_write_unbuffered(char c)
+  *
+  * @param c The character to print.
+  */
++/*
++ * TEMPORARY bring-up aid: every character written to the selected console is
++ * also appended to this linear buffer, so a debugger can read a strictly
++ * ordered log (the framebuffer console on this port scrolls and interleaves
++ * output from several threads, which makes ordering impossible to recover).
++ * Read dbg_bootlog_len and dbg_bootlog[] from gdb; nothing else uses them.
++ */
++char dbg_bootlog[96 * 1024];
++volatile unsigned int dbg_bootlog_len;
++
+ void
+ console_write_char(char c)
+ {
++	unsigned int n = dbg_bootlog_len;
++	if (n + 1 < sizeof(dbg_bootlog)) {
++		dbg_bootlog[n] = c;
++		dbg_bootlog_len = n + 1;
++	}
+ 	console_write(&c, 1);
+ }
+ 
