@@ -1,8 +1,17 @@
 diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
-index 54edb01..3816f5c 100644
+index 54edb01..2d84b66 100644
 --- a/osfmk/vm/vm_kern.c
 +++ b/osfmk/vm/vm_kern.c
-@@ -3567,6 +3567,12 @@ kmem_add_extra_claims(void)
+@@ -3539,6 +3539,8 @@ kmem_add_extra_claims(void)
+ 	 * Determine size of data and pointer kmem_ranges
+ 	 */
+ 	for (uint32_t i = 0; i < kmem_claim_count; i++) {
++		kprintf("KMEMDBG preclaim[%u] %s size=0x%llx\n", i,
++		    kmem_claims[i].kc_name, (uint64_t)kmem_claims[i].kc_size);
+ 		total_claims += kmem_claims[i].kc_size;
+ 	}
+ 	assert((total_claims & PAGE_MASK) == 0);
+@@ -3567,6 +3569,12 @@ kmem_add_extra_claims(void)
  	/*
  	 * Add claims for kmem's ranges
  	 */
@@ -15,7 +24,7 @@ index 54edb01..3816f5c 100644
  	data_range_size += kmem_add_ptr_claims();
  	assert(data_range_size + sprayqtn_range_size +
  	    ((ptr_range_size + kmem_meta_size) * kmem_ptr_ranges) <=
-@@ -3641,6 +3647,8 @@ kmem_scramble_ranges(void)
+@@ -3641,6 +3649,8 @@ kmem_scramble_ranges(void)
  		struct mach_vm_range *sp_range = sp.kc_range;
  		if (vm_map_locate_space(kernel_map, sp.kc_size, 0,
  		    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL) != KERN_SUCCESS) {
@@ -24,7 +33,7 @@ index 54edb01..3816f5c 100644
  			panic("kmem_range_init: vm_map_locate_space failing for claim %s",
  			    sp.kc_name);
  		}
-@@ -3842,6 +3850,8 @@ kmem_init(
+@@ -3842,6 +3852,8 @@ kmem_init(
  		kern_return_t kr;
  
  		while (pmap_virtual_region(region_select, &region_start, &region_size)) {
