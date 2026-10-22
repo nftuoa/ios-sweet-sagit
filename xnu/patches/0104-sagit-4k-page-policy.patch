@@ -1,27 +1,26 @@
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index 42362c5..c3e3046 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
-@@ -396,6 +396,18 @@ arm_init(
+@@ -396,6 +396,18 @@
  
  
  	{
 +#if defined(ARM64_BOARD_CONFIG_SAGIT) && !__ARM_16K_PG__
 +		/*
-+		 * Mi 6: the hardware only implements the 4 KiB granule, but the
-+		 * iPhone X iOS 16 userspace this kernel hosts is built for 16 KiB
-+		 * pages (its CodeDirectory.pageSize is 14).  Keep Apple's 4K-profile
-+		 * page size - 16 KiB VM pages over four 4 KiB PTEs per page
-+		 * (PAGE_RATIO == 4) - instead of deriving it from RAM size, so a
-+		 * memory-map change can never silently downgrade the user ABI to 4 KiB.
++		 * Mi 6 implements only the 4 KiB granule.  Use 4 KiB VM pages as well:
++		 * the 16 KiB-VM-page-over-4-KiB-PTE configuration (PAGE_RATIO == 4) is
++		 * what Apple's RAM-size rule below would pick for a >1 GiB device, but
++		 * no Apple 4 KiB-granule product shipped with more than 1 GiB, and that
++		 * path trips the write_pte_fast() 4-PTE alignment assertion (pmap.c:623)
++		 * during early mapping.  The 4 KiB page size also matches the hardware.
 +		 */
-+		PAGE_SHIFT_CONST = PAGE_MAX_SHIFT;
-+		page_shift_user32 = PAGE_MAX_SHIFT;
++		PAGE_SHIFT_CONST = ARM_PGSHIFT;
++		page_shift_user32 = ARM_PGSHIFT;
 +#else
  		/*
  		 * Select the advertised kernel page size.
  		 */
-@@ -416,6 +428,7 @@ arm_init(
+@@ -416,6 +428,7 @@
  
  		/* 32-bit apps always see 16KB page size */
  		page_shift_user32 = PAGE_MAX_SHIFT;
@@ -29,16 +28,3 @@ index 42362c5..c3e3046 100644
  #ifdef  APPLETYPHOON
  		if (PE_parse_boot_argn("cpus_defeatures", &cpus_defeatures, sizeof(cpus_defeatures))) {
  			if ((cpus_defeatures & 0xF) != 0) {
-diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
-index 00568d3..c1069e7 100644
---- a/osfmk/arm/pmap/pmap.c
-+++ b/osfmk/arm/pmap/pmap.c
-@@ -6881,7 +6881,7 @@ void
- pmap_sync_page_attributes_phys(
- 	ppnum_t pp)
- {
--	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
-+	flush_dcache((vm_offset_t) ((pmap_paddr_t)pp << ARM_PGSHIFT), PAGE_SIZE, TRUE);
- }
- 
- #if CONFIG_COREDUMP
