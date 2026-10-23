@@ -1,0 +1,101 @@
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 1a23b30..b6e88cf 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -148,6 +148,9 @@ pe_init_fiq()
+ 
+ 	// Find the redistributor for this processor
+ 	vm_offset_t gicr_pe_base = find_gicr_pe_base();
++#if defined(SWEET)
++	sweet_gicr_pe = gicr_pe_base;
++#endif
+ 
+ 	// Mark this PE to be awake
+ 	uint32_t gicr_waker = gicr_read32(GICR_WAKER);
+@@ -167,26 +170,6 @@ pe_init_fiq()
+ 		}
+ 	}
+ 
+-#if defined(SWEET)
+-	/*
+-	 * Real hardware with two security states: Group 0 is TrustZone's and
+-	 * non-secure writes to it are ignored. Everything we own is Group 1 NS
+-	 * and arrives as an IRQ (see sleh_irq). GICR_IGROUPR0 reads as zero
+-	 * from the non-secure side even after this write; delivery still works.
+-	 */
+-	gicr_write32(GICR_IGROUPR0, 0xFFFFFFFF);
+-	for (unsigned int i = 0; i < 32; i += 4) {
+-		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+-	}
+-	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
+-#else
+-	// Configure timers and legacy FIQ to be group 0
+-	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
+-
+-	// Enable PPI 27
+-	gicr_write32(GICR_ISENABLER0, (1 << 27));
+-#endif /* SWEET */
+-
+ 	// Enable system register access
+ 	uint64_t icc_sre = __builtin_arm_rsr64("ICC_SRE_EL1");
+ 	icc_sre |= ICC_SRE_SRE;
+@@ -207,17 +190,55 @@ pe_init_fiq()
+ 	__builtin_arm_wsr64("ICC_CTLR_EL1", icc_ctlr);
+ 
+ #if defined(SWEET)
+-	// ABL leaves only ARE_NS set; Linux writes ARE_NS | EnableGrp1A | EnableGrp1
++	/*
++	 * ORDER MATTERS (Mi 6 / MSM8998 bring-up): changing GICD_CTLR.ARE_NS
++	 * resets the SGI/PPI configuration of every redistributor
++	 * (GICR_IGROUPR0 / IPRIORITYR0 / ISENABLER0 go back to their reset
++	 * values).  ABL leaves ARE_NS clear, so programming the redistributor
++	 * first and the distributor afterwards silently wipes the enables: the
++	 * device then reads GICR_ISENABLER0 == 0, and neither the virtual timer
++	 * nor SGI 1 is ever delivered (no timer tick, IOSleep() never returns).
++	 * So: distributor first, per-PE configuration last.  ARE_NS is also
++	 * written on its own, because a write that sets ARE_NS ignores the
++	 * other fields of the same write.
++	 */
+ 	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
+-	gicd_ctlr |= GICD_CTLR_ARE_NS | GICD_CTLR_ENABLEGRP1A | GICD_CTLR_ENABLEGRP1;
+-	gicd_write32(GICD_CTLR, gicd_ctlr);
++	if (!(gicd_ctlr & GICD_CTLR_ARE_NS)) {
++		gicd_write32(GICD_CTLR, gicd_ctlr | GICD_CTLR_ARE_NS);
++		while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++			;
++		}
++		gicd_ctlr = gicd_read32(GICD_CTLR);
++	}
++	gicd_write32(GICD_CTLR, gicd_ctlr | GICD_CTLR_ENABLEGRP1A |
++	    GICD_CTLR_ENABLEGRP1);
+ 	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
+ 		;
+ 	}
++
+ 	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
+ 	__builtin_arm_isb(ISB_SY);
+-	sweet_gicr_pe = gicr_pe_base;
++
++	/*
++	 * Real hardware with two security states: Group 0 is TrustZone's and
++	 * non-secure writes to it are ignored. Everything we own is Group 1 NS
++	 * and arrives as an IRQ (see sleh_irq). The redistributor group
++	 * registers read as zero from the non-secure side even after the write;
++	 * delivery still follows the written value.
++	 */
++	gicr_write32(GICR_IGROUPR0, 0xFFFFFFFF);
++	for (unsigned int i = 0; i < 32; i += 4) {
++		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
++	}
++	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++	__builtin_arm_isb(ISB_SY);
+ #else
++	// Configure timers and legacy FIQ to be group 0
++	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
++
++	// Enable PPI 27
++	gicr_write32(GICR_ISENABLER0, (1 << 27));
++
+ 	// Enable the forwarding of the vtimer interrupt
+ 	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
+ 	gicd_ctlr |= GICD_CTLR_ENABLEGRP0;
