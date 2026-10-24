@@ -1,0 +1,402 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..53b4e03 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -9,20 +9,32 @@
+  * reads canvas-width/canvas-height from the service's provider. The class
+  * here (AppleCLCD, an IOMobileFramebuffer) matches the /arm-io/disp0 nub.
+  *
+- * User client selectors used by CoreAnimation:
+- *   3  GetLayerDefaultSurface [layer, ?] -> [IOSurface port name]
+- *   4  SwapBegin -> [swap id]
+- *   5  SwapEnd, struct 0x46c: +0x50 swap id, +0x54 IOSurface id per layer
+- *      (4 layers), +0x64 rect a / +0xc4 rect b per layer (int x,y,w,h),
+- *      +0x104 enabled layer mask
+- *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h],
++ * User client selectors used by the iOS 16.7 graphics stack (numbers and
++ * argument shapes are from the _kern_xxx thunks in
++ * IOMobileFramebuffer.framework; the full table is below):
++ *   3  GetLayerDefaultSurface -> 1 scalar (IOSurface port)
++ *   4  SwapBegin, 5 SwapEnd (struct in 0x46c, see +0x50/+0x54/+0x64/+0xc4/
++ *      +0x104 below), 6 SwapWait, 7 GetID
++ *   8  GetDisplaySize -> 2 scalars (uint64 width, uint64 height).  This is
++ *      the *physical* panel size CA::WindowServer::Display uses as its
++ *      bounds basis, so it reports 1080x1920 natively.
+  *   12 RequestPowerChange [state]: 0 = display off (backboardd, power
+  *      button / auto-lock), else on. Off fades the panel out over a few
+  *      vsyncs (halving each pixel) and keeps it black until on again;
+  *      the panel itself stays powered (AMOLED black pixels are off).
+- *   18 IsMainDisplay,
+- *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
+- * Everything else is accepted and logged once.
++ *   28 GetDotPitch -> 1 scalar (uint32 ppi), 29 GetDisplayArea -> struct
++ *      out 8 (two float32, panel size in mm), 57 GetColorRemapMode ->
++ *      1 scalar, 72 Enable/DisableNotifications [func, fb, type, 0],
++ *      74 SupportedFrameInfo (scalar + 64-byte struct out),
++ *      79 GetBlock (block id + offset -> byte blob, chunked at 0x1000).
++ *   14/15/17/22/27/33/50/68/82/84 are accepted and logged.
++ *
++ * The display is reported natively: 1080x1920 at 60 Hz, canvas 1080x1920,
++ * dot pitch 428 ppi, panel physical size 64.1x113.9 mm.  The service also
++ * publishes the IORegistry properties QuartzCore reads back
++ * (canvas-width/height on the provider nub, IOMFBDisplayRefresh here) so
++ * that FBSDisplayMode is 1080x1920@60 instead of "0x0 0Hz".
++ * sweetfb_iphonex=1 restores the old 1125x2436 (375x812 pt) presentation.
+  *
+  * SwapEnd copies the enabled layers' surfaces into the panel memory (no
+  * scaling, CPU copy). Vsync (notification type 5) is a 60 Hz timer that
+@@ -49,8 +61,39 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <sys/proc.h>
+ 
++/*
++ * Real selector numbers of AppleCLCD's IOMobileFramebufferUserClient, read
++ * out of the iOS 16.7 IOMobileFramebuffer.framework thunks (_kern_xxx in
++ * the shared cache; see mi6/docs/4k/display-mode.md):
++ *
++ *    3  GetLayerDefaultSurface   -> 1 scalar (IOSurface port)
++ *    4  SwapBegin                -> 1 scalar (swap id)
++ *    5  SwapEnd                   struct in 0x46c (fb+0x18 in the framework)
++ *    6  SwapWait                 n scalars (swap id, timeout, ...)
++ *    7  GetID                    -> 1 scalar
++ *    8  GetDisplaySize           -> 2 scalars (uint64 w, uint64 h)
++ *   12  RequestPowerChange       1 scalar (0 = off)
++ *   14  SetFlags                 2 scalars in, 1 scalar out
++ *   15  SetDebugFlags            2 scalars in, 1 scalar out
++ *   17  SetGammaTable            struct in 0xc0c
++ *   22  SetDisplayDevice         1 scalar (0..4)
++ *   27  GetGammaTable            struct out 0xc0c
++ *   28  GetDotPitch              -> 1 scalar (uint32)
++ *   29  GetDisplayArea           struct out 8 (two float32, millimetres)
++ *   33  EnableDisableVideoPowerSavings  1 scalar
++ *   50  SetBrightnessCorrection  2 scalars
++ *   57  GetColorRemapMode        -> 1 scalar (uint32; 6 = sRGB default)
++ *   68  SetParameter             1 scalar + struct in 8
++ *   72  Enable/DisableNotifications  4 scalars (func, fb, type, 0)
++ *   74  SupportedFrameInfo       1 scalar in, 1 scalar out, struct out 64
++ *   79  GetBlock                 2+n scalars (block id, offset, ...),
++ *                                struct out = min(0x1000, remaining) bytes
++ *   82  GetProtectionOptions     -> 1 scalar
++ *   84  SetContrast              struct in 4
++ */
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -59,9 +102,22 @@ enum {
+ 	kSweetFBGetID                   = 7,
+ 	kSweetFBGetDisplaySize          = 8,
+ 	kSweetFBRequestPowerChange      = 12,
+-	kSweetFBIsMainDisplay           = 18,
++	kSweetFBSetFlags                = 14,
++	kSweetFBSetDebugFlags           = 15,
++	kSweetFBSetGammaTable           = 17,
++	kSweetFBSetDisplayDevice        = 22,
++	kSweetFBGetGammaTable           = 27,
+ 	kSweetFBGetDotPitch             = 28,
++	kSweetFBGetDisplayArea          = 29,
++	kSweetFBEnableDisableVideoPowerSavings = 33,
++	kSweetFBSetBrightnessCorrection = 50,
++	kSweetFBGetColorRemapMode       = 57,
++	kSweetFBSetParameter            = 68,
+ 	kSweetFBNotifications           = 72,
++	kSweetFBSupportedFrameInfo      = 74,
++	kSweetFBGetBlock                = 79,
++	kSweetFBGetProtectionOptions    = 82,
++	kSweetFBSetContrast             = 84,
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+@@ -69,18 +125,24 @@ enum {
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+-#define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
++#define SWEET_FB_REFRESH_HZ             60
++#define SWEET_FB_DOT_PITCH              428     /* ppi: 5.15" 1080x1920 panel */
++#define SWEET_FB_BLOCK_DIGITAL_OUT      0x40    /* GetDigitalOutMode block */
++#define SWEET_FB_BLOCK_DIGITAL_OUT_SIZE 40
++#define SWEET_FB_COLOR_REMAP_SRGB       6
++#define SWEET_FB_FORMAT_BGRA            0x42475241
+ /*
+- * The iOS userland only has status bar / layout data for real iPhone
+- * screens (UIKit: "No status bar visual provider for screen", the red
+- * rdar://45025538 bar for 360x800 points). The display is therefore
+- * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+- * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+- * Boot-arg sweetfb_native=1 presents the real panel size instead.
++ * QuartzCore's AppleDisplay constructor copies physical size, canvas size,
++ * scale, dot pitch and panel physical size out of IOMobileFramebuffer and
++ * hands them to CA::WindowServer::Display::set_size().  The panel is
++ * reported natively: 1080x1920 at 60 Hz, dot pitch 428 ppi, so the
++ * CA display mode is 1080x1920@60 and the canvas is 1080x1920.  The old
++ * "pretend to be an iPhone X" 1125x2436 presentation is still available
++ * with sweetfb_iphonex=1 (it crops the panel and must not be mixed with
++ * the native canvas properties).
+  */
+-#define SWEET_FB_LOGICAL_W              1125
+-#define SWEET_FB_LOGICAL_H              2436
+-#define SWEET_FB_FORMAT_BGRA            0x42475241
++#define SWEET_FB_IPHONEX_W              1125
++#define SWEET_FB_IPHONEX_H              2436
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -103,6 +165,9 @@ public:
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
++	uint32_t      fRefreshHz;               /* 60 */
++	uint32_t      fDotPitch;                /* ppi */
++	float         fAreaW, fAreaH;           /* panel physical size, mm */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+@@ -149,6 +214,49 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * QuartzCore's AppleDisplay constructor reads IOMFBDisplayRefresh as a
++ * CFDictionary through IOMobileFramebufferCopyProperty() and feeds
++ * "displayRefreshStepMachTime" to CA::WindowServer::AppleCLCDDisplay::
++ * heartbeat_rate() (0x1882dc324 in the iOS 16.7 QuartzCore image).  The
++ * value is a mach_absolute_time() delta in ticks: multiplying it by the
++ * timebase gives the frame period in seconds, i.e. 1/60.  Without this
++ * property heartbeat_rate() falls back to a 1/60 s constant, but the
++ * FBSDisplayMode refresh published to SpringBoard stays 0 Hz.
++ */
++static void
++sweet_fb_set_refresh_property(IOService *service, uint32_t hz)
++{
++	mach_timebase_info_data_t tb;
++	OSDictionary *dict;
++	OSNumber *step;
++	uint64_t ticks;
++
++	clock_timebase_info(&tb);
++	if (hz == 0) {
++		hz = SWEET_FB_REFRESH_HZ;
++	}
++	/* ticks = (1e9 / hz) ns converted to mach absolute time units */
++	ticks = 1000000000ULL / hz;
++	if (tb.numer != 0 && tb.denom != 0) {
++		ticks = ticks * (uint64_t)tb.denom / (uint64_t)tb.numer;
++	}
++	if (ticks > 0xffffffffULL) {
++		ticks = 0xffffffffULL;
++	}
++	dict = OSDictionary::withCapacity(1);
++	if (dict == NULL) {
++		return;
++	}
++	step = OSNumber::withNumber((unsigned long long)ticks, 32);
++	if (step != NULL) {
++		dict->setObject("displayRefreshStepMachTime", step);
++		step->release();
++	}
++	service->setProperty("IOMFBDisplayRefresh", dict);
++	dict->release();
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -166,16 +274,27 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+ 	}
+-	int native = 0;
+-	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
++	/*
++	 * Native presentation by default: physical = canvas = panel size.
++	 * sweetfb_iphonex=1 keeps the old 1125x2436 (375x812 pt) iPhone X
++	 * presentation, which crops the 1080x1920 panel; it is only useful
++	 * when the UI scale is known to come from the D22AP MobileGestalt
++	 * answers rather than from the IOMFB canvas size.
++	 */
++	int iphonex = 0;
++	PE_parse_boot_argn("sweetfb_iphonex", &iphonex, sizeof(iphonex));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+-		fLogicalW = SWEET_FB_LOGICAL_W;
+-		fLogicalH = SWEET_FB_LOGICAL_H;
++	if (iphonex && fWidth <= SWEET_FB_IPHONEX_W && fHeight <= SWEET_FB_IPHONEX_H) {
++		fLogicalW = SWEET_FB_IPHONEX_W;
++		fLogicalH = SWEET_FB_IPHONEX_H;
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	fRefreshHz = SWEET_FB_REFRESH_HZ;
++	fDotPitch = SWEET_FB_DOT_PITCH;
++	fAreaW = (float)fWidth * 25.4f / (float)fDotPitch;
++	fAreaH = (float)fHeight * 25.4f / (float)fDotPitch;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -200,6 +319,22 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/*
++	 * canvas-width/height are read by IOMobileFramebufferOpen() from the
++	 * parent registry entry (the /arm-io/disp0 nub), when it fills
++	 * fb+0x4f4/+0x4f8; IOMobileFramebufferGetCanvasSizes() then returns
++	 * that pair as the second (last) entry, and
++	 * CA::WindowServer::IOMFBDisplay::set_physical_and_canvas_sizes()
++	 * takes the last entry as the canvas size.  Publish it on both the
++	 * provider and ourselves so it does not depend on the ADT.
++	 */
++	if (provider != NULL) {
++		provider->setProperty("canvas-width", (unsigned long long)fLogicalW, 32);
++		provider->setProperty("canvas-height", (unsigned long long)fLogicalH, 32);
++	}
++	setProperty("canvas-width", (unsigned long long)fLogicalW, 32);
++	setProperty("canvas-height", (unsigned long long)fLogicalH, 32);
++	sweet_fb_set_refresh_property(this, fRefreshHz);
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+@@ -471,6 +606,34 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+ 
+ static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
+ 
++/*
++ * One chunk of a GetBlock() reply.  Only block 0x40 has an observable
++ * layout: IOMobileFramebufferGetDigitalOutMode() reads two int32 at +4
++ * (mode) and +8 (state) out of the 40 bytes it asked for.  The 0x48
++ * (2752 B), 0x4a (2056 B) and 0x4d (1580 B) blocks are vendor blobs;
++ * QuartzCore only records whether the 0x4d probe returned success and
++ * only checks the first word of 0x48/0x4a, so they stay zero.
++ */
++static void
++sweet_fb_get_block(AppleCLCD *fb, uint64_t block, uint64_t offset,
++    void *buffer, size_t size)
++{
++	uint8_t rec[SWEET_FB_BLOCK_DIGITAL_OUT_SIZE];
++
++	if (buffer == NULL || size == 0 || block != SWEET_FB_BLOCK_DIGITAL_OUT) {
++		return;         /* the caller has already zeroed the buffer */
++	}
++	bzero(rec, sizeof(rec));
++	uint32_t mode = 1;      /* digital output enabled */
++	uint32_t state = fb->fPowerOff ? 0 : 1;
++	memcpy(rec + 4, &mode, sizeof(mode));
++	memcpy(rec + 8, &state, sizeof(state));
++	for (size_t i = 0; i < size; i++) {
++		uint64_t src = offset + i;
++		((uint8_t *)buffer)[i] = src < sizeof(rec) ? rec[src] : 0;
++	}
++}
++
+ IOReturn
+ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -480,6 +643,13 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	uint64_t out[2] = { 0, 0 };
+ 	uint32_t outCount = 0;
+ 
++	/* Start from a defined structure output for every selector; cases
++	 * below overwrite the first bytes of the blocks they define. */
++	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL &&
++	    args->structureOutputSize != 0) {
++		bzero(args->structureOutput, args->structureOutputSize);
++	}
++
+ 	switch (selector) {
+ 	case kSweetFBGetLayerDefaultSurface:
+ 		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
+@@ -507,18 +677,76 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBGetDisplaySize:
++		/* 2 x uint64.  QuartzCore caches this in IOMFBDisplay
++		 * +0x4a8/+0x4b0 and uses it as the "physical" size in
++		 * set_physical_and_canvas_sizes(); with the default native
++		 * presentation it is the real 1080x1920 panel. */
+ 		out[0] = fFB->fLogicalW;
+ 		out[1] = fFB->fLogicalH;
+ 		outCount = 2;
+ 		break;
+-	case kSweetFBIsMainDisplay:
+-		out[0] = 1;
++	case kSweetFBGetDotPitch:
++		/* 1 x uint32, pixels per inch (panel_dot_pitch()). */
++		out[0] = fFB->fDotPitch;
+ 		outCount = 1;
+ 		break;
+-	case kSweetFBGetDotPitch:
+-		out[0] = SWEET_FB_DOT_PITCH;
++	case kSweetFBGetDisplayArea:
++		/* struct out 8: two float32, panel physical width/height in mm
++		 * (IOMFBDisplay::panel_physical_size()). */
++		if (args->structureOutputDescriptor == NULL &&
++		    args->structureOutput != NULL && args->structureOutputSize >= 8) {
++			float area[2] = { fFB->fAreaW, fFB->fAreaH };
++			memcpy(args->structureOutput, area, sizeof(area));
++		}
++		break;
++	case kSweetFBGetColorRemapMode:
++		/* 1 x uint32; 6 is what the framework itself substitutes when the
++		 * call fails, and means the plain sRGB remap table. */
++		out[0] = SWEET_FB_COLOR_REMAP_SRGB;
++		outCount = 1;
++		break;
++	case kSweetFBSetDisplayDevice:
++		if (args->scalarInputCount < 1 || args->scalarInput[0] > 4) {
++			ret = kIOReturnBadArgument;
++		}
++		break;
++	case kSweetFBSetFlags:
++	case kSweetFBSetDebugFlags:
++	case kSweetFBEnableDisableVideoPowerSavings:
++	case kSweetFBSetBrightnessCorrection:
++	case kSweetFBSetParameter:
++	case kSweetFBSetContrast:
++		/* Accepted and ignored; they only tune the real AppleCLCD pipe. */
++		out[0] = 0;
++		outCount = 1;
++		break;
++	case kSweetFBGetProtectionOptions:
++		out[0] = 0;
+ 		outCount = 1;
+ 		break;
++	case kSweetFBSupportedFrameInfo:
++		/* scalar in: frame-info type; scalar out: 1 value (0 = ok); struct
++		 * out 64 (IOMFB frame capabilities).  No consumer in the iOS 16.7
++		 * QuartzCore path looks past the IOReturn, so leave it zeroed. */
++		out[0] = 0;
++		outCount = 1;
++		break;
++	case kSweetFBGetBlock:
++		/* scalars: block id, byte offset (the framework splits requests
++		 * larger than 0x1000 into 0x1000-byte chunks); structure out is
++		 * the chunk.  0x40 = digital out mode, 0x4d = 1580-byte blob that
++		 * QuartzCore probes but never parses. */
++		if (args->scalarInputCount < 2) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		if (args->structureOutputDescriptor != NULL) {
++			ret = kIOReturnUnsupported;
++			break;
++		}
++		sweet_fb_get_block(fFB, args->scalarInput[0], args->scalarInput[1],
++		    args->structureOutput, args->structureOutputSize);
++		break;
+ 	case kSweetFBNotifications:
+ 		if (args->scalarInputCount >= 3 && args->scalarInput[2] < SWEET_FB_NOTIFY_TYPES) {
+ 			uint32_t type = (uint32_t)args->scalarInput[2];
+@@ -553,9 +781,6 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+ 		args->scalarOutput[i] = i < outCount ? out[i] : 0;
+ 	}
+-	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+-		bzero(args->structureOutput, args->structureOutputSize);
+-	}
+ 	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
+ 		if (selector < 64) {
+ 			sweet_fb_logged |= 1ULL << selector;
