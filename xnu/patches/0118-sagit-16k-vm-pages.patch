@@ -1,0 +1,202 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index e163d1b..e667b3f 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -398,15 +398,28 @@ arm_init(
+ 	{
+ #if defined(ARM64_BOARD_CONFIG_SAGIT) && !__ARM_16K_PG__
+ 		/*
+-		 * Mi 6 implements only the 4 KiB granule.  Use 4 KiB VM pages as well:
+-		 * the 16 KiB-VM-page-over-4-KiB-PTE configuration (PAGE_RATIO == 4) is
+-		 * what Apple's RAM-size rule below would pick for a >1 GiB device, but
+-		 * no Apple 4 KiB-granule product shipped with more than 1 GiB, and that
+-		 * path trips the write_pte_fast() 4-PTE alignment assertion (pmap.c:623)
+-		 * during early mapping.  The 4 KiB page size also matches the hardware.
++		 * B1 configuration: 4 KiB hardware granule, 16 KiB VM pages
++		 * (PAGE_SHIFT_CONST 14, PAGE_RATIO 4).
++		 *
++		 * The granule and the VM page size are independent decisions.  The
++		 * granule is forced to 4 KiB by the SoC: ID_AA64MMFR0_EL1.TGran16
++		 * reads 0, so TCR_EL1.TG0 must select the 4 KiB granule and every
++		 * translation table page is a 4 KiB page.  The VM page size is pure
++		 * software, and it has to be 16 KiB: the iOS 16 userland this kernel
++		 * exists to host (iPhone X / D22AP) is code-signed with
++		 * CodeDirectory.pageSize == 14, and cs_validate_codedirectory()
++		 * only accepts pageSize == 12 or pageSize == PAGE_SHIFT.  With 4 KiB
++		 * VM pages every signed binary on the root filesystem is rejected,
++		 * so the kernel boots and then cannot exec anything.
++		 *
++		 * Deliberately not the RAM-size heuristic below: the page size is a
++		 * property of the user ABI we are matching, not of how much RAM a
++		 * particular boot happens to have.  Falling back to 4 KiB pages on
++		 * a small-memory configuration would produce a kernel that silently
++		 * refuses the same binaries instead of failing loudly.
+ 		 */
+-		PAGE_SHIFT_CONST = ARM_PGSHIFT;
+-		page_shift_user32 = ARM_PGSHIFT;
++		PAGE_SHIFT_CONST = PAGE_MAX_SHIFT;
++		page_shift_user32 = PAGE_MAX_SHIFT;
+ #else
+ 		/*
+ 		 * Select the advertised kernel page size.
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index f267a21..3ce9773 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -618,6 +618,20 @@ write_pte_fast(pt_entry_t *ptep, pt_entry_t pte)
+ 	 */
+ 	__unreachable_ok_push
+ 	if (TEST_PAGE_RATIO_4) {
++		/*
++		 * A 16 KiB VM page is mapped by four consecutive 4 KiB PTEs that must
++		 * form one 32-byte aligned group, so every caller has to hand us the
++		 * first PTE of a group: the leaf index of the VA being mapped must be
++		 * a multiple of PAGE_RATIO.  Writing a sub-page (4 KiB granular)
++		 * mapping through this path would silently overwrite three unrelated
++		 * PTEs, so reject it instead of corrupting the neighbours.
++		 *
++		 * Note that this is a property of the *virtual address*, not of ptep:
++		 * pmap_enter_options() rejects misaligned VAs up front (see the
++		 * PAGE_RATIO check there), and the remaining fixed mappings are built
++		 * with PAGE_SIZE steps.  If this ever fires, find the caller that
++		 * maps a partial VM page rather than relaxing the check.
++		 */
+ 		if (((uintptr_t)ptep) & 0x1f) {
+ 			panic("%s: PTE write is unaligned, ptep=%p, pte=%p",
+ 			    __func__, ptep, (void*)pte);
+@@ -1268,6 +1282,15 @@ PMAP_SUPPORT_PROTOTYPES(
+  * aligned address. Readers of the globals (e.g. lldb, panic server) need
+  * to check both addresses anyway for backward compatibility. So for now
+  * we leave H6 and H7 where they were.
++ *
++ * Note for the 4 KiB granule + 16 KiB VM page configuration (sagit B1): this
++ * selects by *granule* (ARM_PGSHIFT), so the alias lands at +0x2000, i.e. in
++ * the middle of a 16 KiB group.  That is harmless: pmap_map_globals() stores
++ * this one PTE directly instead of going through write_pte_fast(), only the
++ * first 4 KiB of the group is ever populated (lowGlo fits in one 4 KiB page),
++ * and pmap_virtual_region() reserves the whole 8 MiB low-globals region in
++ * kernel_map so no other mapping can claim the remaining PTEs.  Do not move it
++ * to +PAGE_SIZE: the value is ABI for external readers of lowGlo.
+  */
+ #if (ARM_PGSHIFT == 14)
+ #define LOWGLOBAL_ALIAS         (LOW_GLOBAL_BASE_ADDRESS + 0x4000)
+@@ -5863,6 +5886,25 @@ pmap_enter_options_internal(
+ 		    pmap, (uint64_t)v);
+ 	}
+ 
++	__unreachable_ok_push
++	if (TEST_PAGE_RATIO_4 && ((v) & PAGE_MASK)) {
++		/*
++		 * 16 KiB VM pages over 4 KiB PTEs: one VM page is represented by a
++		 * group of PAGE_RATIO consecutive leaf PTEs, and write_pte_fast()
++		 * writes the whole group at once.  A mapping that starts inside a
++		 * group cannot be represented - it would either overwrite three
++		 * unrelated PTEs or trip write_pte_fast()'s alignment check - so
++		 * reject it here, where the VA and the pmap are still known, rather
++		 * than deep inside the PTE write.  Callers that legitimately need a
++		 * 4 KiB granularity (the CPU copy windows, the low globals alias)
++		 * write a single PTE themselves and never come through here.
++		 */
++		panic("%s: pmap %p v 0x%llx is not aligned to PAGE_SIZE 0x%x; "
++		    "with PAGE_RATIO == 4 a mapping must cover a whole VM page",
++		    __func__, pmap, (uint64_t)v, (unsigned int)PAGE_SIZE);
++	}
++	__unreachable_ok_pop
++
+ 	/* Only check kernel_pmap here as CPUWINDOWS only exists in kernel address space. */
+ 	if (__improbable((pmap == kernel_pmap) && (v >= CPUWINDOWS_BASE) && (v < CPUWINDOWS_TOP))) {
+ 		panic("pmap_enter_options() kernel pmap %p v 0x%llx belongs to [CPUWINDOWS_BASE: 0x%llx, CPUWINDOWS_TOP: 0x%llx)",
+@@ -6882,7 +6924,16 @@ void
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) ((pmap_paddr_t)pp << ARM_PGSHIFT), PAGE_SIZE, TRUE);
++	/*
++	 * pp is a VM page number, so it has to be scaled by PAGE_SHIFT, not by
++	 * the hardware granule: on a 16 KiB-granule SoC the two are the same and
++	 * the distinction is invisible, but with 16 KiB VM pages on a 4 KiB
++	 * granule (PAGE_RATIO == 4) "pp << ARM_PGSHIFT" names the first quarter
++	 * of a completely different page - the cache maintenance would then miss
++	 * the page it was asked about.  ptoa() matches what cache_sync_page()
++	 * does for pmap_sync_page_data_phys().
++	 */
++	flush_dcache((vm_offset_t)ptoa(pp), PAGE_SIZE, TRUE);
+ }
+ 
+ #if CONFIG_COREDUMP
+@@ -10889,10 +10940,32 @@ pmap_create_commpages(vm_map_address_t *kernel_data_addr, vm_map_address_t *kern
+ 	const pt_attr_t * const pt_attr = pmap_get_pt_attr(commpage_pmap_default);
+ 	int num_ptes = pt_attr_leaf_size(pt_attr) >> PTE_SHIFT;
+ 
++	/*
++	 * A VM page is mapped by PAGE_RATIO consecutive leaf PTEs, and
++	 * write_pte_fast() writes all of them as a single 32-byte aligned group,
++	 * so the leaf index we slide to has to be the first PTE of a group.
++	 *
++	 * On Apple's shipped 16 KiB-page configurations PAGE_RATIO is 1 and any
++	 * leaf index works, which is why picking a uniformly random one was fine
++	 * there.  With 16 KiB VM pages on a 4 KiB granule (PAGE_RATIO == 4) three
++	 * out of four random indices land in the middle of a group and panic in
++	 * write_pte_fast() during the very first commpage mapping - that is the
++	 * "PTE write is unaligned" panic this configuration used to hit at
++	 * vm_commpage_init().  Slide over the group-aligned leaves only: the PFZ
++	 * address is still randomized, just over (num_ptes / PAGE_RATIO) slots
++	 * instead of num_ptes.
++	 *
++	 * The collision checks below still work: both _COMM_PAGE64_BASE_ADDRESS
++	 * and _COMM_PAGE64_RO_ADDRESS are themselves group-aligned, so a text
++	 * group can only overlap one of them by starting exactly on it, which is
++	 * what the loop tests for.
++	 */
++	int num_text_slots = num_ptes / PAGE_RATIO;
++
+ 	vm_map_address_t commpage_text_va = 0;
+ 
+ 	do {
+-		int text_leaf_index = random() % num_ptes;
++		int text_leaf_index = (random() % num_text_slots) * PAGE_RATIO;
+ 
+ 		// Generate a VA for the commpage text with the same root and twig index as data
+ 		// comm page, but with new leaf index we've just generated.
+diff --git a/pexpert/pexpert/arm64/SAGIT.h b/pexpert/pexpert/arm64/SAGIT.h
+index 92f50ac..c675c2a 100644
+--- a/pexpert/pexpert/arm64/SAGIT.h
++++ b/pexpert/pexpert/arm64/SAGIT.h
+@@ -17,13 +17,14 @@
+  *     so the timer and IPIs arrive as Group 1 IRQs through sleh_irq();
+  *   - Qualcomm timer PPI numbering: the virtual timer XNU uses (CNTV) is
+  *     INTID 16 + 3 = 19, IPIs are SGI 1;
+- *   - 4K pages, 64-byte cache lines, PSCI CPU_ON, no P/E clusters.  The SoC
+- *     implements ONLY the 4 KiB granule: ID_AA64MMFR0_EL1 reads 0x1122 on the
+- *     device (read at EL1: PARange=2 / 40-bit PA, TGran4 supported, TGran16=0,
+- *     TGran64=0).  A 16 KiB TCR_EL1.TG0 is not executable there: the first
+- *     fetch after the MMU is enabled takes a translation fault.  QEMU's
+- *     cortex-a53 model reports the same 0x1122 and reproduces that fault, while
+- *     its cortex-a76 model (0x101122, TGran16=1) runs the same 16 KiB kernel.
++ *   - 4 KiB hardware granule with 16 KiB VM pages, 64-byte cache lines, PSCI
++ *     CPU_ON, no P/E clusters.  The SoC implements ONLY the 4 KiB granule:
++ *     ID_AA64MMFR0_EL1 reads 0x1122 on the device (read at EL1: PARange=2 /
++ *     40-bit PA, TGran4 supported, TGran16=0, TGran64=0).  A 16 KiB
++ *     TCR_EL1.TG0 is not executable there: the first fetch after the MMU is
++ *     enabled takes a translation fault.  QEMU's cortex-a53 model reports the
++ *     same 0x1122 and reproduces that fault, while its cortex-a76 model
++ *     (0x101122, TGran16=1) runs the same 16 KiB-granule kernel.
+  *
+  * Nothing in SWEET.h carries an SoC address - no UART, framebuffer or storage
+  * base - so what genuinely differs on this board is described in the ADT
+@@ -61,6 +62,15 @@
+  * 0xfffffe0007004000 KVA layout.  None of that is executable on Kryo 280, so
+  * drop the granule macro and take the 4 KiB geometry Apple uses for its own
+  * 4 KiB arm64 kernels (see BCM2837.h).
++ *
++ * Dropping __ARM_16K_PG__ only changes the *granule* (TCR_EL1.TG0, 4 KiB
++ * translation tables, the 0xfffffff0_xxxx KVA layout, T0SZ/T1SZ 26).  The VM
++ * page size is independent of it and is pinned to 16 KiB by arm_init.c
++ * (PAGE_SHIFT_CONST = PAGE_MAX_SHIFT, so PAGE_RATIO == 4): every VM page is
++ * then described by four consecutive 4 KiB PTEs.  That 16 KiB VM page size is
++ * part of the user ABI (the iOS 16 binaries are signed with
++ * CodeDirectory.pageSize 14), so it must not be "simplified" by making
++ * PAGE_SHIFT follow ARM_PGSHIFT.
+  */
+ #undef  __ARM_16K_PG__
+ 
