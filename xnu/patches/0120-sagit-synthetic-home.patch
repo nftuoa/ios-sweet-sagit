@@ -1,0 +1,483 @@
+diff --git a/iokit/Kernel/arm/hid/IOHIDEventService.h b/iokit/Kernel/arm/hid/IOHIDEventService.h
+index 4e79ad5..73ae6a4 100644
+--- a/iokit/Kernel/arm/hid/IOHIDEventService.h
++++ b/iokit/Kernel/arm/hid/IOHIDEventService.h
+@@ -51,6 +51,9 @@ public:
+ 	virtual IOReturn        newUserClient(task_t owningTask, void *securityID, UInt32 type,
+ 	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
+ 
++	/* Number of open user clients: non-zero once backboardd is reading us. */
++	UInt32                  clientCount();
++
+ protected:
+ 	virtual bool            handleOpen(IOService *client, IOOptionBits options, void *argument) APPLE_KEXT_OVERRIDE;
+ 	virtual void            handleClose(IOService *client, IOOptionBits options) APPLE_KEXT_OVERRIDE;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..d20e026 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -15,12 +15,19 @@
+  * Hardware drivers feed them through the C entry points sweet_hid_key()
+  * and sweet_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
+  * every N seconds, to test the event path without input hardware.
++ *
++ * Boot args sweethome=N / sweetswipe=N inject a home press and a swipe-up
++ * gesture so a device with no touchscreen driver can unlock itself; see
++ * the comment above sweetUnlockStart() for the details.
+  */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <libkern/c++/OSArray.h>
+ #include <pexpert/pexpert.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
+ 
+ #include "IOHIDEventService.h"
+ #include "IOHIDEventServiceUserClient.h"
+@@ -31,6 +38,32 @@
+ 
+ extern "C" uint64_t mach_absolute_time(void);
+ 
++/*
++ * Mach MIG routine; <kern/thread.h> only declares thread_terminate_internal()
++ * and the self-terminate helper (bsd/dev/sweet_touch.c declares it too).
++ */
++extern "C" kern_return_t thread_terminate(thread_t);
++
++/*
++ * Sleep that actually blocks the calling kernel thread.  IOSleep() is a
++ * delay_for_interval() spin and the synthetic-unlock delays are tens of
++ * seconds, so a wait channel is used instead, as bsd/dev/sweet_keys.c and
++ * bsd/dev/sweet_touch.c do.  Only called from the unlock thread below.
++ */
++static int gSweetHIDSleepChan;
++
++static void
++sweetHIDDelayMS(UInt32 ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&gSweetHIDSleepChan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void sweetUnlockStart(void);
++
+ /* One open client: the user client and its event callback. */
+ class IOHIDEventServiceClient : public OSObject {
+ 	OSDeclareDefaultStructors(IOHIDEventServiceClient);
+@@ -202,6 +235,17 @@ IOHIDEventService::handleIsOpen(const IOService *client) const
+ 	return open;
+ }
+ 
++UInt32
++IOHIDEventService::clientCount()
++{
++	UInt32 count;
++
++	IOLockLock(_clientLock);
++	count = _clients ? _clients->getCount() : 0;
++	IOLockUnlock(_clientLock);
++	return count;
++}
++
+ void
+ IOHIDEventService::dispatchEvent(IOHIDEvent *event, IOOptionBits options)
+ {
+@@ -330,6 +374,7 @@ class SweetHIDButtons : public IOHIDEventService {
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void key(UInt32 usage, bool down);
++	void pressHome(void);
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Consumer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Csmr_ConsumerControl; }
+@@ -361,12 +406,15 @@ class SweetHIDTouch : public IOHIDEventService {
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void touch(int finger, bool down, int x, int y);
++	void swipeUp(void);
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Digitizer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Dig_TouchScreen; }
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
+ private:
++	int panelCoord(int permille, bool horizontal) const;
+ 	IOLock *fLock;
++	int fPanelW, fPanelH;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+@@ -393,6 +441,7 @@ SweetHIDButtons::start(IOService *provider)
+ 	gSweetButtons = this;
+ 	registerService();
+ 	IOLog("SWEET HID: buttons registered (test every %u s)\n", fTestSecs);
++	sweetUnlockStart();
+ 	return true;
+ }
+ 
+@@ -409,6 +458,21 @@ SweetHIDButtons::key(UInt32 usage, bool down)
+ 	}
+ }
+ 
++/*
++ * Home press for the synthetic unlock.  Consumer page usage 0x40 ("Menu")
++ * is the usage AppleM68Buttons reports for the home button and the one
++ * backboardd turns into a home-button HID event.  It is held 120 ms so it
++ * is not discarded as a contact bounce.
++ */
++void
++SweetHIDButtons::pressHome(void)
++{
++	IOLog("SWEET HID: synthetic home press\n");
++	key(kHIDUsage_Csmr_Menu, true);
++	sweetHIDDelayMS(120);
++	key(kHIDUsage_Csmr_Menu, false);
++}
++
+ void
+ SweetHIDButtons::testFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -428,23 +492,43 @@ SweetHIDButtons::testFired(OSObject *owner, IOTimerEventSource *sender)
+ bool
+ SweetHIDTouch::start(IOService *provider)
+ {
++	PE_Video video;
++
+ 	fLock = IOLockAlloc();
+ 	if (!fLock || !IOHIDEventService::start(provider)) {
+ 		return false;
+ 	}
+-	int native = 0;
+-	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	/*
++	 * The digitizer normalizes coordinates to the presented display and
++	 * backboardd maps them onto the display AppleCLCD publishes, so the
++	 * panel and logical sizes must match SweetFramebuffer.cpp: the real
++	 * panel by default (1080x1920 on sagit), or the old 1125x2436 iPhone X
++	 * crop with sweetfb_iphonex=1, which centres the panel inside the
++	 * logical display (fOffX/fOffY).
++	 */
++	PE_current_console(&video);
++	fPanelW = video.v_width ? (int)video.v_width : 1080;
++	fPanelH = video.v_height ? (int)video.v_height : 2400;
++	fLogicalW = fPanelW;
++	fLogicalH = fPanelH;
++	int iphonex = 0;
++	if (PE_parse_boot_argn("sweetfb_iphonex", &iphonex, sizeof(iphonex)) && iphonex &&
++	    fPanelW <= 1125 && fPanelH <= 2436) {
++		fLogicalW = 1125;
++		fLogicalH = 2436;
++	}
++	fOffX = (fLogicalW - fPanelW) / 2;
++	fOffY = (fLogicalH - fPanelH) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+-	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+-	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
++	/* Panel size in mm, 16.16: 428 ppi, the dot pitch AppleCLCD reports. */
++	setProperty("SurfaceWidth", (unsigned long long)(((int64_t)fPanelW * 25400 / 428) * 65536 / 1000), 32);
++	setProperty("SurfaceHeight", (unsigned long long)(((int64_t)fPanelH * 25400 / 428) * 65536 / 1000), 32);
+ 	gSweetTouch = this;
+ 	registerService();
+-	IOLog("SWEET HID: touch registered\n");
++	IOLog("SWEET HID: touch registered (panel %dx%d, display %dx%d at %d,%d)\n",
++	    fPanelW, fPanelH, fLogicalW, fLogicalH, fOffX, fOffY);
++	sweetUnlockStart();
+ 	return true;
+ }
+ 
+@@ -458,12 +542,12 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	x = x < 0 ? 0 : (x > fPanelW - 1 ? fPanelW - 1 : x);
++	y = y < 0 ? 0 : (y > fPanelH - 1 ? fPanelH - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+-	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
++	/* Panel pixels -> the presented logical display (see start()). */
+ 	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+ 	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+@@ -472,8 +556,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > fPanelW - 1 - SWEET_TOUCH_EDGE_PX ||
++		    y < SWEET_TOUCH_EDGE_PX || y > fPanelH - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
+@@ -538,6 +622,259 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	collection->release();
+ }
+ 
++/* 1/1000 of the presented display -> panel pixel (inverse of touch()). */
++int
++SweetHIDTouch::panelCoord(int permille, bool horizontal) const
++{
++	int logical = horizontal ? fLogicalW : fLogicalH;
++	int off = horizontal ? fOffX : fOffY;
++
++	return (int)(((int64_t)permille * (int64_t)logical) / 1000) - off;
++}
++
++/*
++ * Lock-screen swipe-up: press at (50%, 85%) of the display, drag straight
++ * up to (50%, 15%) in eight 20 ms steps, then lift.  A slow drag rather
++ * than a fling, so the lock screen tracks the finger and dismisses on lift.
++ * On sagit's 1080x1920 panel that is (540,1632) -> (540,288).
++ */
++void
++SweetHIDTouch::swipeUp(void)
++{
++	const int steps = 8;
++	int x = panelCoord(500, true);
++	int y0 = panelCoord(850, false);
++	int y1 = panelCoord(150, false);
++
++	IOLog("SWEET HID: synthetic swipe %d,%d -> %d,%d (%d moves)\n", x, y0, x, y1, steps);
++	touch(0, true, x, y0);
++	for (int i = 1; i <= steps; i++) {
++		sweetHIDDelayMS(20);
++		touch(0, true, x, y0 + (y1 - y0) * i / steps);
++	}
++	sweetHIDDelayMS(20);
++	touch(0, false, x, y1);
++}
++
++/*
++ * Synthetic unlock: sagit has no working touchscreen driver yet, so the
++ * kernel injects the gesture SpringBoard needs to leave the lock screen.
++ *
++ * On an iPhone X (D22AP) there is no home button and the lock screen is
++ * dismissed by dragging up; a home-button HID event is still accepted
++ * (backboardd turns consumer usage 0x40 into a home-button event) and can
++ * wake the display.  Both go through the services above, which already
++ * publish themselves as built-in Apple HID devices.
++ *
++ * Boot args, in seconds since IOKit matched the HID services (a few seconds
++ * into boot; calibrate against the "SWEET HID: unlock: services at ...
++ * ms" console line):
++ *
++ *   sweethome=N        press+release Home after N s
++ *   sweetswipe=N       swipe up after N s (raised to sweethome+1 if both)
++ *   sweetunlockreps=R  repeat the sequence R times, default 3
++ *   sweetunlockgap=G   seconds between repeats, default 6
++ *
++ * sweethome alone implies sweetswipe=sweethome+1; nothing is injected when
++ * neither sweethome nor sweetswipe is present.
++ *
++ * dispatchEvent() with no client is a silent no-op, and backboardd opens
++ * these services only once userland runs, so every attempt first waits for
++ * a client (15 x 2 s, logging each retry).  The repeats cover the window
++ * where backboardd exists but SpringBoard has not drawn its lock screen
++ * yet: the kernel cannot see SpringBoard itself.
++ */
++#define SWEET_UNLOCK_SERVICE_WAIT_MS	30000
++#define SWEET_UNLOCK_CLIENT_TRIES	15
++#define SWEET_UNLOCK_CLIENT_RETRY_MS	2000
++#define SWEET_UNLOCK_MAX_REPS		10
++#define SWEET_UNLOCK_MAX_SECS		7200
++#define SWEET_UNLOCK_GAP_DEFAULT	6
++
++static bool     gSweetUnlockLaunched;
++static bool     gSweetUnlockHaveHome;
++static bool     gSweetUnlockHaveSwipe;
++static UInt32   gSweetUnlockHomeSecs;
++static UInt32   gSweetUnlockSwipeSecs;
++static UInt32   gSweetUnlockReps;
++static UInt32   gSweetUnlockGapSecs;
++
++static UInt32
++sweetUnlockClientCount(void)
++{
++	UInt32 clients = 0;
++
++	if (gSweetButtons) {
++		clients = gSweetButtons->clientCount();
++	}
++	if (clients == 0 && gSweetTouch) {
++		clients = gSweetTouch->clientCount();
++	}
++	return clients;
++}
++
++static void
++sweetUnlockWaitUntil(UInt64 *elapsedMS, UInt64 targetMS)
++{
++	while (*elapsedMS < targetMS) {
++		sweetHIDDelayMS(100);
++		*elapsedMS += 100;
++	}
++}
++
++/* True once some userland client is reading the events. */
++static bool
++sweetUnlockWaitForClient(UInt64 *elapsedMS)
++{
++	for (UInt32 tries = 0; tries < SWEET_UNLOCK_CLIENT_TRIES; tries++) {
++		if (sweetUnlockClientCount() != 0) {
++			return true;
++		}
++		IOLog("SWEET HID: unlock: no HID client yet (retry %u/%u)\n",
++		    (unsigned)(tries + 1), (unsigned)SWEET_UNLOCK_CLIENT_TRIES);
++		sweetHIDDelayMS(SWEET_UNLOCK_CLIENT_RETRY_MS);
++		*elapsedMS += SWEET_UNLOCK_CLIENT_RETRY_MS;
++	}
++	return sweetUnlockClientCount() != 0;
++}
++
++static void
++sweetUnlockThread(void *arg __unused, wait_result_t result __unused)
++{
++	UInt64 elapsedMS = 0;
++
++	/* start() sets the globals just before registerService(). */
++	for (UInt32 waited = 0; waited < SWEET_UNLOCK_SERVICE_WAIT_MS; waited += 100) {
++		if (gSweetButtons && gSweetTouch) {
++			break;
++		}
++		sweetHIDDelayMS(100);
++		elapsedMS += 100;
++	}
++	IOLog("SWEET HID: unlock: services at %llu ms (buttons=%d touch=%d clients=%u)\n",
++	    (unsigned long long)elapsedMS, gSweetButtons != NULL, gSweetTouch != NULL,
++	    (unsigned)sweetUnlockClientCount());
++
++	if (!gSweetButtons && !gSweetTouch) {
++		IOLog("SWEET HID: unlock: no HID service, nothing to do\n");
++		goto out;
++	}
++	if (gSweetUnlockHaveHome && !gSweetButtons) {
++		IOLog("SWEET HID: unlock: buttons service missing, no home press\n");
++	}
++	if (gSweetUnlockHaveSwipe && !gSweetTouch) {
++		IOLog("SWEET HID: unlock: touch service missing, no swipe\n");
++	}
++
++	for (UInt32 attempt = 0; attempt < gSweetUnlockReps; attempt++) {
++		UInt64 baseMS = (UInt64)attempt * gSweetUnlockGapSecs * 1000;
++
++		if (gSweetUnlockHaveHome && gSweetButtons) {
++			sweetUnlockWaitUntil(&elapsedMS,
++			    baseMS + (UInt64)gSweetUnlockHomeSecs * 1000);
++			if (!sweetUnlockWaitForClient(&elapsedMS)) {
++				IOLog("SWEET HID: unlock: giving up, no HID client\n");
++				break;
++			}
++			IOLog("SWEET HID: unlock %u/%u: home at %llu ms\n",
++			    (unsigned)(attempt + 1), (unsigned)gSweetUnlockReps,
++			    (unsigned long long)elapsedMS);
++			gSweetButtons->pressHome();
++		}
++		if (gSweetUnlockHaveSwipe && gSweetTouch) {
++			sweetUnlockWaitUntil(&elapsedMS,
++			    baseMS + (UInt64)gSweetUnlockSwipeSecs * 1000);
++			if (!sweetUnlockWaitForClient(&elapsedMS)) {
++				IOLog("SWEET HID: unlock: giving up, no HID client\n");
++				break;
++			}
++			IOLog("SWEET HID: unlock %u/%u: swipe at %llu ms\n",
++			    (unsigned)(attempt + 1), (unsigned)gSweetUnlockReps,
++			    (unsigned long long)elapsedMS);
++			gSweetTouch->swipeUp();
++		}
++	}
++	IOLog("SWEET HID: unlock: done after %llu ms\n", (unsigned long long)elapsedMS);
++
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/*
++ * Called from both start() methods; only the first call does anything, so
++ * the thread is created once, after the first service is published (it then
++ * waits for the other service by itself).
++ */
++static void
++sweetUnlockStart(void)
++{
++	int home = 0, swipe = 0, reps = 3, gap = SWEET_UNLOCK_GAP_DEFAULT;
++	bool haveHome, haveSwipe;
++	thread_t thread;
++	kern_return_t kr;
++
++	if (gSweetUnlockLaunched) {
++		return;
++	}
++	gSweetUnlockLaunched = true;
++
++	haveHome = PE_parse_boot_argn("sweethome", &home, sizeof(home)) != 0;
++	haveSwipe = PE_parse_boot_argn("sweetswipe", &swipe, sizeof(swipe)) != 0;
++	if (!haveHome && !haveSwipe) {
++		return;	/* not requested */
++	}
++	if (home < 0) {
++		home = 0;
++	} else if (home > SWEET_UNLOCK_MAX_SECS) {
++		home = SWEET_UNLOCK_MAX_SECS;
++	}
++	if (swipe < 0) {
++		swipe = 0;
++	} else if (swipe > SWEET_UNLOCK_MAX_SECS) {
++		swipe = SWEET_UNLOCK_MAX_SECS;
++	}
++	if (!haveSwipe) {
++		swipe = home + 1;
++		haveSwipe = true;
++	}
++	if (haveHome && swipe < home + 1) {
++		swipe = home + 1;
++	}
++	(void)PE_parse_boot_argn("sweetunlockreps", &reps, sizeof(reps));
++	(void)PE_parse_boot_argn("sweetunlockgap", &gap, sizeof(gap));
++	if (reps < 1) {
++		reps = 1;
++	} else if (reps > SWEET_UNLOCK_MAX_REPS) {
++		reps = SWEET_UNLOCK_MAX_REPS;
++	}
++	if (gap < 1) {
++		gap = 1;
++	}
++
++	gSweetUnlockHaveHome = haveHome;
++	gSweetUnlockHaveSwipe = haveSwipe;
++	gSweetUnlockHomeSecs = (UInt32)home;
++	gSweetUnlockSwipeSecs = (UInt32)swipe;
++	gSweetUnlockReps = (UInt32)reps;
++	gSweetUnlockGapSecs = (UInt32)gap;
++
++	if (haveHome) {
++		IOLog("SWEET HID: unlock plan: home at %u s, swipe at %u s, %u attempt(s) every %u s\n",
++		    (unsigned)home, (unsigned)swipe, (unsigned)reps, (unsigned)gap);
++	} else {
++		IOLog("SWEET HID: unlock plan: swipe only at %u s, %u attempt(s) every %u s\n",
++		    (unsigned)swipe, (unsigned)reps, (unsigned)gap);
++	}
++
++	kr = kernel_thread_start(&sweetUnlockThread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		IOLog("SWEET HID: unlock: kernel_thread_start failed %d\n", kr);
++	}
++}
++
+ /* key: 0 power (side button), 1 volume up, 2 volume down, 3 home */
+ extern "C" void
+ sweet_hid_key(int key, int down)
