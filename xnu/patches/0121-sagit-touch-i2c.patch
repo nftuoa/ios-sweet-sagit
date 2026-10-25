@@ -34,12 +34,6 @@ index 03defe6..d92aefb 100644
  	}
  }
 -#endif /* ARM64_BOARD_CONFIG_SWEET */
-+#elif defined(ARM64_BOARD_CONFIG_SAGIT)
-+/* SAGIT gets the same entry point from bsd/dev/sweet_touch_sagit.c. */
-+void
-+sweet_touch_init(void)
-+{
-+}
 +#endif /* ARM64_BOARD_CONFIG_SWEET && !ARM64_BOARD_CONFIG_SAGIT */
 diff --git a/bsd/dev/sweet_touch_sagit.c b/bsd/dev/sweet_touch_sagit.c
 new file mode 100644
