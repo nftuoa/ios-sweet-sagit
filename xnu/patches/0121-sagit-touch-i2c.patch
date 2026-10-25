@@ -187,6 +187,7 @@ index 0000000..c75a214
 +
 +/* i2c_8bit_addr_from_msg(): 7-bit address << 1, write direction. */
 +#define I2C_ADDR8(a)          ((uint8_t)((a) << 1))
++#define I2C_ADDR8_RD(a)       ((uint8_t)(((a) << 1) | 1u))
 +
 +/* From the 19.2 MHz XO, vendor clk table: 400 kHz = (28,14), 100 kHz = (124,62). */
 +#define QUP_CLK_CTL_400K      ((14u << 16) | 28u)
@@ -476,7 +477,7 @@ index 0000000..c75a214
 +qup_msg(uint8_t addr, const uint8_t *wr, unsigned wlen, uint8_t *rd,
 +    unsigned rlen)
 +{
-+	uint8_t tx[4 + 32];
++	uint8_t tx[8 + 32];
 +	uint8_t rx[2 + 64];
 +	unsigned ntx, mx_wr, mx_rd;
 +	uint32_t cfg, status = 0;
@@ -489,23 +490,47 @@ index 0000000..c75a214
 +		return EIO;
 +	}
 +
++	/*
++	 * Three message shapes, all through the same FIFO tag stream:
++	 *   write only:            START WADDR [DATA_WR_STOP len data]
++	 *   read only:             START RADDR [DATA_RD_STOP len]
++	 *   write then read:       START WADDR [DATA_WR len data]
++	 *                          START RADDR [DATA_RD_STOP len]   (repeated START)
++	 * RMI4 needs the last shape: the register address must be written and
++	 * then read back without an intervening STOP.  A read-only message uses
++	 * the read direction address (R/W bit set).
++	 */
 +	ntx = 0;
-+	tx[ntx++] = QUP_TAG_START;
-+	tx[ntx++] = I2C_ADDR8(addr);
-+	if (rlen) {
++	if (wlen) {
++		tx[ntx++] = QUP_TAG_START;
++		tx[ntx++] = I2C_ADDR8(addr);
++		if (rlen) {
++			tx[ntx++] = QUP_TAG_DATA_WR;
++			tx[ntx++] = (uint8_t)wlen;
++			for (unsigned i = 0; i < wlen; ++i) {
++				tx[ntx++] = wr[i];
++			}
++			tx[ntx++] = QUP_TAG_START;
++			tx[ntx++] = I2C_ADDR8_RD(addr);
++			tx[ntx++] = QUP_TAG_DATA_RD_STOP;
++			tx[ntx++] = (uint8_t)rlen;
++		} else {
++			tx[ntx++] = QUP_TAG_DATA_WR_STOP;
++			tx[ntx++] = (uint8_t)wlen;
++			for (unsigned i = 0; i < wlen; ++i) {
++				tx[ntx++] = wr[i];
++			}
++		}
++	} else if (rlen) {
++		tx[ntx++] = QUP_TAG_START;
++		tx[ntx++] = I2C_ADDR8_RD(addr);
 +		tx[ntx++] = QUP_TAG_DATA_RD_STOP;
 +		tx[ntx++] = (uint8_t)rlen;
-+		mx_wr = ntx;
-+		mx_rd = rlen + 2;
 +	} else {
-+		tx[ntx++] = QUP_TAG_DATA_WR_STOP;
-+		tx[ntx++] = (uint8_t)wlen;
-+		for (unsigned i = 0; i < wlen; ++i) {
-+			tx[ntx++] = wr[i];
-+		}
-+		mx_wr = ntx;
-+		mx_rd = 0;
++		return EINVAL;
 +	}
++	mx_wr = ntx;
++	mx_rd = rlen ? rlen + 2 : 0;
 +	if (mx_wr > st.out_fifo || mx_rd > st.in_fifo) {
 +		printf("SAGIT TOUCH: message does not fit FIFO (tx=%u/%u rx=%u/%u)\n",
 +		    mx_wr, st.out_fifo, mx_rd, st.in_fifo);
