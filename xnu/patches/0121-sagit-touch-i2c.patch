@@ -1,0 +1,1111 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..a5a0bc4 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/sweet_touch_sagit.c		standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 03defe6..d92aefb 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -5,7 +5,13 @@
+  * No firmware/config upload or direct PMIC writes. Only IC data write:
+  * zero to GT9896's event status after reading a report. See touch2/report.md.
+  */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SAGIT (MSM8998) has its own implementation in bsd/dev/sweet_touch_sagit.c:
++ * this file drives the SM7150 GENI SE7 at 0xa84000 and TLMM pins 8/9/90,
++ * none of which exist on MSM8998. Exactly one of the two provides
++ * sweet_touch_init() for a given board.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) && !defined(ARM64_BOARD_CONFIG_SAGIT)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+@@ -657,4 +663,10 @@ sweet_touch_init(void)
+ 		printf("SWEET TOUCH: kernel_thread_start failed %d\n", kr);
+ 	}
+ }
+-#endif /* ARM64_BOARD_CONFIG_SWEET */
++#elif defined(ARM64_BOARD_CONFIG_SAGIT)
++/* SAGIT gets the same entry point from bsd/dev/sweet_touch_sagit.c. */
++void
++sweet_touch_init(void)
++{
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET && !ARM64_BOARD_CONFIG_SAGIT */
+diff --git a/bsd/dev/sweet_touch_sagit.c b/bsd/dev/sweet_touch_sagit.c
+new file mode 100644
+index 0000000..c75a214
+--- /dev/null
++++ b/bsd/dev/sweet_touch_sagit.c
+@@ -0,0 +1,1062 @@
++/*
++ * SAGIT (Xiaomi Mi 6, MSM8998) touch bring-up: BLSP1 QUP5 I2C master +
++ * polled Synaptics DSX (RMI4 over I2C) report reader.
++ *
++ * Everything here is derived from the board's own sources, not guessed from
++ * the SM7150 "sweet" driver:
++ *   - bus/GPIO/rails/IRQ: the phone's stock device tree
++ *     (mi6/sagit/stock-sagit.dtb, node i2c@c179000/synaptics_dsi_i2c@20);
++ *   - QUP register map and tag protocol: Xiaomi's sagit-o-oss kernel,
++ *     include/linux/i2c/i2c-msm-v2.h and drivers/i2c/busses/i2c-msm-v2.c
++ *     (this is a QUP v2.2.1 with version-two tags, not the GENI SE that
++ *     bsd/dev/sweet_touch.c drives on SM7150);
++ *   - DSX protocol: sagit-o-oss drivers/input/touchscreen/synaptics_dsx/
++ *     (page-select I2C, RMI4 PDT, F01, F12 with 8-byte finger records).
++ *
++ * Design notes / honest limits (see mi6/docs/4k/touch-sagit.md):
++ *   - polled only: no GIC interrupt is registered. QUP5 is GIC SPI 99
++ *     (INTID 131) and the DSX attention line is TLMM GPIO 125 (whose summary
++ *     IRQ is SPI 208 / INTID 240); neither has been validated on this port.
++ *   - the 1.8 V rail (pm8998_l6) is RPM-owned and there is no MSM8998
++ *     regulator driver in this tree, so it is NOT touched. The fixed
++ *     "disp_vddts_vreg" (TLMM GPIO 50, active high) is driven high, because
++ *     that one is a plain GPIO. If the DSX NACKs, the log says so and the
++ *     rail question is the next thing to chase.
++ *   - the finger record size (8 bytes: status, x, y, z, wx, wy) is what the
++ *     vendor driver compiles in (REPORT_2D_Z + REPORT_2D_W); the raw report
++ *     is hex-dumped at sweettouchdebug=2 so it can be confirmed on hardware.
++ */
++#if defined(ARM64_BOARD_CONFIG_SAGIT)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_touch_init(void);
++
++/* ------------------------------------------------------------------ */
++/* Platform addresses (stock DTB)                                      */
++/* ------------------------------------------------------------------ */
++/* i2c@c179000: reg = <0xc179000 0x600>, interrupts = <0 0x63 0>,       */
++/* clocks = <&gcc BLSP1_AHB>, <&gcc BLSP1_QUP5_I2C_APPS>.               */
++#define SGT_QUP5_PA     0x0c179000u
++/* qcom,gcc@100000: reg = <0x100000 0xb0000>.                           */
++#define SGT_GCC_PA      0x00100000u
++/* pinctrl@03400000, 0xc00000: MSPM tiles NORTH +0x500000, EAST +0x900000. */
++#define SGT_TLMM_N_PA   0x03900000u
++#define SGT_TLMM_E_PA   0x03d00000u
++#define SGT_TLMM_N_SIZE 0x000d0000u   /* GPIO 50 lives at 50*0x1000 */
++#define SGT_TLMM_E_SIZE 0x00080000u   /* GPIO 87..125 */
++
++/* TLMM register layout, pinctrl-msm8998.c PINGROUP(): mux<<2, pull in      */
++/* bits[1:0], drive in bits[8:6], output-enable bit 9; IO register at +4.   */
++#define TLMM_CFG(pin)   ((uint32_t)(pin) * 0x1000u)
++#define TLMM_IO(pin)    (TLMM_CFG(pin) + 4u)
++#define TLMM_MUX_GPIO   0u
++#define TLMM_MUX_BLSP_I2C5 3u         /* funcs[]: gpio,spi5,uart2_b,i2c5,... */
++#define TLMM_PULL_NONE  0u
++#define TLMM_PULL_DOWN  1u
++#define TLMM_PULL_UP    3u
++#define TLMM_DRV_2MA    0u
++#define TLMM_DRV_16MA   7u
++#define TLMM_OE         (1u << 9)
++
++/* Board GPIOs (stock DTB). */
++#define GPIO_TS_AVDD_EN  50    /* disp_vddts_vreg: regulator-fixed, GPIO 50  */
++#define GPIO_TS_SDA      87    /* qcom,i2c-dat = <&tlmm 0x57 0>  = 87       */
++#define GPIO_TS_SCL      88    /* qcom,i2c-clk = <&tlmm 0x58 0>  = 88       */
++#define GPIO_TS_RESET    89    /* synaptics,reset-gpio = <&tlmm 0x59 0>     */
++#define GPIO_TS_IRQ      125   /* synaptics,irq-gpio = <&tlmm 0x7d 0x2008>  */
++
++/* GCC clock branch registers (msm-clocks-hwio-8998.h). */
++#define GCC_BLSP1_AHB_CBCR        0x17004u
++#define GCC_BLSP1_QUP5_APPS_CBCR  0x21008u
++#define GCC_BLSP1_QUP5_APPS_RCGR  0x21020u
++#define GCC_CBCR_CLK_OFF          (1u << 31)
++
++/* ------------------------------------------------------------------ */
++/* QUP v2.2.1 registers (sagit-o-oss include/linux/i2c/i2c-msm-v2.h)    */
++/* ------------------------------------------------------------------ */
++#define QUP_CONFIG            0x000u
++#define QUP_STATE             0x004u
++#define QUP_IO_MODES          0x008u
++#define QUP_SW_RESET          0x00cu
++#define QUP_OPERATIONAL       0x018u
++#define QUP_ERROR_FLAGS       0x01cu
++#define QUP_ERROR_FLAGS_EN    0x020u
++#define QUP_OPERATIONAL_MASK  0x028u
++#define QUP_HW_VERSION        0x030u
++#define QUP_MX_OUTPUT_CNT     0x100u
++#define QUP_OUT_FIFO_CNT      0x10cu
++#define QUP_OUT_FIFO          0x110u
++#define QUP_MX_WRITE_CNT      0x150u
++#define QUP_MX_INPUT_CNT      0x200u
++#define QUP_MX_READ_CNT       0x208u
++#define QUP_IN_FIFO_CNT       0x214u
++#define QUP_IN_FIFO           0x218u
++#define QUP_I2C_CLK_CTL       0x400u
++#define QUP_I2C_STATUS        0x404u
++#define QUP_I2C_MASTER_CFG    0x408u
++#define QUP_I2C_BUS_CLR       0x40cu
++
++/* QUP_STATE fields. */
++#define QUP_STATE_RESET       0u
++#define QUP_STATE_RUN         1u
++#define QUP_STATE_PAUSE       3u
++#define QUP_STATE_MASK        3u
++#define QUP_STATE_VALID       (1u << 2)
++#define QUP_I2C_MAST_GEN      (1u << 4)
++
++/* QUP_CONFIG / QUP_IO_MODES fields. */
++#define QUP_MINI_CORE_I2C     (2u << 8)
++#define QUP_N_VAL_8BIT        7u
++#define QUP_NO_INPUT          (1u << 7)
++#define QUP_NO_OUTPUT         (1u << 6)
++#define QUP_PACK_EN           (1u << 15)
++#define QUP_UNPACK_EN         (1u << 14)
++
++/* QUP_OPERATIONAL flags. */
++#define QUP_IN_FIFO_NOT_EMPTY (1u << 5)
++#define QUP_OUT_SVC_FLAG      (1u << 8)
++#define QUP_IN_SVC_FLAG       (1u << 9)
++#define QUP_MX_OUT_DONE       (1u << 10)
++#define QUP_MX_IN_DONE        (1u << 11)
++
++/* QUP_I2C_STATUS error bits. */
++#define QUP_STATUS_NACK       (1u << 3)
++#define QUP_STATUS_ERR_MASK   0x0380003cu
++#define QUP_ERR_FLAGS_MASK    0x3cu
++
++/* Version-two tags (i2c-msm-v2.h QUP_TAG2_*). */
++#define QUP_TAG_START         0x81u
++#define QUP_TAG_DATA_WR       0x82u
++#define QUP_TAG_DATA_WR_STOP  0x83u
++#define QUP_TAG_DATA_RD       0x85u
++#define QUP_TAG_DATA_RD_STOP  0x87u
++
++/* i2c_8bit_addr_from_msg(): 7-bit address << 1, write direction. */
++#define I2C_ADDR8(a)          ((uint8_t)((a) << 1))
++
++/* From the 19.2 MHz XO, vendor clk table: 400 kHz = (28,14), 100 kHz = (124,62). */
++#define QUP_CLK_CTL_400K      ((14u << 16) | 28u)
++#define QUP_CLK_CTL_100K      ((62u << 16) | 124u)
++
++/* ------------------------------------------------------------------ */
++/* Synaptics RMI4-over-I2C constants (sagit-o-oss synaptics_dsx)       */
++/* ------------------------------------------------------------------ */
++#define DSX_I2C_ADDR          0x20    /* reg = <0x20>                      */
++#define DSX_UB_I2C_ADDR       0x2c    /* synaptics,ub-i2c-addr (fw update) */
++#define DSX_PAGE_SELECT_REG   0xff
++#define DSX_PDT_START         0x00e9
++#define DSX_PDT_END           0x00d0
++#define DSX_PDT_ENTRY_SIZE    6
++#define DSX_PDT_MAX_ENTRIES   5
++#define DSX_F01               0x01
++#define DSX_F12               0x12
++#define DSX_F34               0x34
++#define DSX_F01_QUERY_LEN     21
++#define DSX_F12_FINGER_SIZE   8       /* status,x,y,z,wx,wy (REPORT_2D_Z/W) */
++#define DSX_MAX_FINGERS       10
++#define DSX_STATUS_CRC_BUSY   0x06    /* F01 device status: CRC in progress  */
++#define DSX_DEVICE_CTRL_CONFIGURED 0x80
++#define DSX_POLL_CHUNK        16      /* report bytes per QUP read          */
++#define DSX_XFER_RETRIES      3
++
++#define TOUCH_MAX             10u
++
++/* ------------------------------------------------------------------ */
++/* State                                                               */
++/* ------------------------------------------------------------------ */
++struct sagit_dsx {
++	vm_offset_t qup, gcc, tlmm_n, tlmm_e;
++	bool mapped, started, dead;
++	unsigned out_fifo, in_fifo;
++	unsigned poll_ms, debug, delay_s;
++	bool slow_100k;               /* sweettouchslow=1 -> 100 kHz */
++	int scale_y;                  /* 0 = report raw panel pixels */
++	int finger_size;
++
++	/* PDT results */
++	unsigned f01_query, f01_cmd, f01_ctrl, f01_data;
++	unsigned f12_query, f12_ctrl, f12_data;
++	unsigned intr_regs;
++	unsigned num_fingers;
++	unsigned data1_offset;
++	unsigned sensor_max_x, sensor_max_y;
++	unsigned page;                /* current RMI4 page */
++	bool probed;
++
++	/* report de-duplication */
++	uint32_t active;
++	int x[TOUCH_MAX], y[TOUCH_MAX];
++	unsigned polls, errors, reports, logged_raw;
++	uint32_t last_intr;
++};
++
++static struct sagit_dsx st;
++static int touch_sleep_chan;
++
++/* ------------------------------------------------------------------ */
++/* MMIO helpers (same barriers as bsd/dev/sweet_touch.c / sweet_spmi.c) */
++/* ------------------------------------------------------------------ */
++static uint32_t
++touch_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++touch_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++touch_wait(unsigned ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&touch_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* delay() takes microseconds in XNU; spin in 10 us steps up to `ms`. */
++static bool
++touch_poll_clear(vm_offset_t base, uint32_t off, uint32_t mask, unsigned ms)
++{
++	for (unsigned i = 0; i < ms * 100u; ++i) {
++		if (!(touch_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++static void
++touch_memdump(const char *tag, uint16_t addr, const uint8_t *buf, unsigned len)
++{
++	char line[49];
++
++	for (unsigned off = 0; off < len; off += 16) {
++		unsigned n = len - off < 16 ? len - off : 16;
++		for (unsigned j = 0; j < n; ++j) {
++			(void)snprintf(line + j * 3u, 4, "%02x ", buf[off + j]);
++		}
++		line[n * 3u] = 0;
++		printf("SAGIT TOUCH: %s %#x: %s\n", tag, (unsigned)(addr + off), line);
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* TLMM                                                                */
++/* ------------------------------------------------------------------ */
++static void
++touch_gpio(vm_offset_t base, unsigned pin, unsigned mux, unsigned pull,
++    unsigned drive, bool out, bool high)
++{
++	uint32_t off = TLMM_CFG(pin);
++	uint32_t cfg;
++
++	if (out) {
++		/* Latch the level before enabling the output driver. */
++		uint32_t io = touch_rd(base, TLMM_IO(pin));
++		touch_wr(base, TLMM_IO(pin), (io & ~2u) | (high ? 2u : 0u));
++	}
++	cfg = touch_rd(base, off);
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? TLMM_OE : 0u);
++	touch_wr(base, off, cfg);
++}
++
++/* ------------------------------------------------------------------ */
++/* GCC clocks                                                          */
++/* ------------------------------------------------------------------ */
++static bool
++touch_clocks(void)
++{
++	static const struct {
++		const char *name;
++		uint32_t off;
++	} cbcr[] = {
++		{ "blsp1_ahb", GCC_BLSP1_AHB_CBCR },
++		{ "qup5_i2c_apps", GCC_BLSP1_QUP5_APPS_CBCR },
++	};
++
++	printf("SAGIT TOUCH: gcc ahb=%#x qup5=%#x rcgr=%#x\n",
++	    touch_rd(st.gcc, GCC_BLSP1_AHB_CBCR),
++	    touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_CBCR),
++	    touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_RCGR));
++
++	for (unsigned i = 0; i < sizeof(cbcr) / sizeof(cbcr[0]); ++i) {
++		if (!(touch_rd(st.gcc, cbcr[i].off) & GCC_CBCR_CLK_OFF)) {
++			continue; /* already running (ABL or another driver) */
++		}
++		touch_wr(st.gcc, cbcr[i].off, 1u); /* CBCR enable */
++		if (!touch_poll_clear(st.gcc, cbcr[i].off, GCC_CBCR_CLK_OFF, 20)) {
++			printf("SAGIT TOUCH: %s clock did not come up (%#x)\n",
++			    cbcr[i].name, touch_rd(st.gcc, cbcr[i].off));
++			return false;
++		}
++	}
++	printf("SAGIT TOUCH: clocks on, rcgr=%#x ahb=%#x qup5=%#x\n",
++	    touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_RCGR),
++	    touch_rd(st.gcc, GCC_BLSP1_AHB_CBCR),
++	    touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_CBCR));
++	return true;
++}
++
++/* ------------------------------------------------------------------ */
++/* QUP: FIFO sizes, state machine, one message                         */
++/* ------------------------------------------------------------------ */
++static void
++qup_fifo_sizes(void)
++{
++	static const unsigned blk_sz[] = { 16, 16, 32, 0 };
++	static const unsigned fifo_mult[] = { 2, 4, 8, 16 };
++	uint32_t io = touch_rd(st.qup, QUP_IO_MODES);
++
++	st.out_fifo = blk_sz[(io >> 0) & 3u] * fifo_mult[(io >> 2) & 3u];
++	st.in_fifo = blk_sz[(io >> 5) & 3u] * fifo_mult[(io >> 7) & 3u];
++	printf("SAGIT TOUCH: qup io_modes=%#x out_fifo=%u in_fifo=%u\n",
++	    io, st.out_fifo, st.in_fifo);
++}
++
++/* The core reports state changes by setting QUP_STATE.VALID. */
++static bool
++qup_wait_valid(unsigned ms)
++{
++	for (unsigned i = 0; i < ms * 100u; ++i) {
++		if (touch_rd(st.qup, QUP_STATE) & QUP_STATE_VALID) {
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++static bool
++qup_state_set(uint32_t state)
++{
++	if (!qup_wait_valid(10)) {
++		return false; /* core clock not running */
++	}
++	touch_wr(st.qup, QUP_STATE, state);
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t v = touch_rd(st.qup, QUP_STATE);
++		if ((v & QUP_STATE_VALID) && ((v & QUP_STATE_MASK) == state)) {
++			return true;
++		}
++		delay(10);
++	}
++	printf("SAGIT TOUCH: qup state %u timeout (state=%#x)\n", state,
++	    touch_rd(st.qup, QUP_STATE));
++	return false;
++}
++
++static bool
++qup_init(void)
++{
++	touch_wr(st.qup, QUP_SW_RESET, 1u);
++	delay(100);
++	if (!qup_state_set(QUP_STATE_RESET)) {
++		return false;
++	}
++	touch_wr(st.qup, QUP_CONFIG, QUP_N_VAL_8BIT | QUP_MINI_CORE_I2C);
++	touch_wr(st.qup, QUP_ERROR_FLAGS_EN, QUP_ERR_FLAGS_MASK);
++	touch_wr(st.qup, QUP_OPERATIONAL_MASK, QUP_IN_SVC_FLAG | QUP_OUT_SVC_FLAG);
++	/* Version-two tags: the 0x81/0x82/0x85 byte protocol. */
++	touch_wr(st.qup, QUP_I2C_MASTER_CFG, 1u);
++	qup_fifo_sizes();
++	printf("SAGIT TOUCH: qup hw_version=%#x state=%#x master_cfg=%#x\n",
++	    touch_rd(st.qup, QUP_HW_VERSION), touch_rd(st.qup, QUP_STATE),
++	    touch_rd(st.qup, QUP_I2C_MASTER_CFG));
++	if (!(touch_rd(st.qup, QUP_STATE) & QUP_I2C_MAST_GEN)) {
++		printf("SAGIT TOUCH: I2C_MAST_GEN=0, QUP is not an I2C master\n");
++		return false;
++	}
++	return true;
++}
++
++/* Push `len` bytes into the TX FIFO in 4-byte words, zero padding the tail. */
++static void
++qup_push(const uint8_t *buf, unsigned len)
++{
++	uint32_t word = 0;
++	unsigned j = 0;
++
++	for (unsigned i = 0; i < len; ++i) {
++		word |= (uint32_t)buf[i] << (8u * j);
++		if (++j == 4u) {
++			touch_wr(st.qup, QUP_OUT_FIFO, word);
++			word = 0;
++			j = 0;
++		}
++	}
++	if (j) {
++		touch_wr(st.qup, QUP_OUT_FIFO, word);
++	}
++}
++
++static void
++qup_drain(uint8_t *buf, unsigned len)
++{
++	uint32_t word = 0;
++
++	for (unsigned i = 0; i < len; ++i) {
++		if ((i & 3u) == 0) {
++			word = touch_rd(st.qup, QUP_IN_FIFO);
++		}
++		buf[i] = (uint8_t)(word >> (8u * (i & 3u)));
++	}
++}
++
++/*
++ * One I2C message. `wr`/`wlen` are the bytes to write (the QUP tags are
++ * prepended here); `rd`/`rlen` the reply, without the two tag bytes the QUP
++ * echoes back in front of the data.
++ */
++static int
++qup_msg(uint8_t addr, const uint8_t *wr, unsigned wlen, uint8_t *rd,
++    unsigned rlen)
++{
++	uint8_t tx[4 + 32];
++	uint8_t rx[2 + 64];
++	unsigned ntx, mx_wr, mx_rd;
++	uint32_t cfg, status = 0;
++	int err = ETIMEDOUT;
++
++	if (wlen > 32 || rlen > 64) {
++		return EINVAL;
++	}
++	if (st.dead) {
++		return EIO;
++	}
++
++	ntx = 0;
++	tx[ntx++] = QUP_TAG_START;
++	tx[ntx++] = I2C_ADDR8(addr);
++	if (rlen) {
++		tx[ntx++] = QUP_TAG_DATA_RD_STOP;
++		tx[ntx++] = (uint8_t)rlen;
++		mx_wr = ntx;
++		mx_rd = rlen + 2;
++	} else {
++		tx[ntx++] = QUP_TAG_DATA_WR_STOP;
++		tx[ntx++] = (uint8_t)wlen;
++		for (unsigned i = 0; i < wlen; ++i) {
++			tx[ntx++] = wr[i];
++		}
++		mx_wr = ntx;
++		mx_rd = 0;
++	}
++	if (mx_wr > st.out_fifo || mx_rd > st.in_fifo) {
++		printf("SAGIT TOUCH: message does not fit FIFO (tx=%u/%u rx=%u/%u)\n",
++		    mx_wr, st.out_fifo, mx_rd, st.in_fifo);
++		return EINVAL;
++	}
++
++	if (!qup_state_set(QUP_STATE_RESET)) {
++		st.dead = true;
++		return EIO;
++	}
++	touch_wr(st.qup, QUP_MX_INPUT_CNT, 0);
++	touch_wr(st.qup, QUP_MX_OUTPUT_CNT, 0);
++	touch_wr(st.qup, QUP_MX_READ_CNT, mx_rd);
++	touch_wr(st.qup, QUP_MX_WRITE_CNT, mx_wr);
++	cfg = QUP_N_VAL_8BIT | QUP_MINI_CORE_I2C | (rlen ? 0u : QUP_NO_INPUT);
++	touch_wr(st.qup, QUP_CONFIG, cfg);
++	touch_wr(st.qup, QUP_IO_MODES, QUP_PACK_EN | QUP_UNPACK_EN);
++	touch_wr(st.qup, QUP_OPERATIONAL_MASK, QUP_IN_SVC_FLAG | QUP_OUT_SVC_FLAG);
++	touch_wr(st.qup, QUP_OPERATIONAL, 0xffffffffu); /* clear stale flags */
++	touch_wr(st.qup, QUP_I2C_STATUS, QUP_STATUS_ERR_MASK);
++	touch_wr(st.qup, QUP_ERROR_FLAGS, QUP_ERR_FLAGS_MASK);
++
++	if (!qup_state_set(QUP_STATE_RUN)) {
++		st.dead = true;
++		return EIO;
++	}
++	touch_wr(st.qup, QUP_I2C_CLK_CTL,
++	    st.slow_100k ? QUP_CLK_CTL_100K : QUP_CLK_CTL_400K);
++	if (!qup_state_set(QUP_STATE_PAUSE)) {
++		st.dead = true;
++		return EIO;
++	}
++	qup_push(tx, ntx);
++	if (!qup_state_set(QUP_STATE_RUN)) {
++		st.dead = true;
++		return EIO;
++	}
++
++	/* Poll for completion. The clock is 400 kHz, so 2 ms per byte worst case. */
++	for (unsigned i = 0; i < (10u + 3u * (mx_wr + mx_rd)) * 100u; ++i) {
++		uint32_t op = touch_rd(st.qup, QUP_OPERATIONAL);
++		uint32_t errs = touch_rd(st.qup, QUP_ERROR_FLAGS);
++
++		status = touch_rd(st.qup, QUP_I2C_STATUS);
++		if (status & QUP_STATUS_ERR_MASK) {
++			err = (status & QUP_STATUS_NACK) ? ENXIO : EIO;
++			break;
++		}
++		if (errs & QUP_ERR_FLAGS_MASK) {
++			err = EIO;
++			break;
++		}
++		if (mx_rd) {
++			if (op & QUP_MX_IN_DONE) {
++				err = 0;
++				break;
++			}
++		} else if (op & (QUP_OUT_SVC_FLAG | QUP_MX_OUT_DONE)) {
++			err = 0;
++			break;
++		}
++		delay(10);
++	}
++
++	/* Drain before resetting: reset may drop whatever is in the RX FIFO. */
++	if (!err && mx_rd) {
++		unsigned want = mx_rd;
++
++		if (want > sizeof(rx)) {
++			want = sizeof(rx);
++		}
++		qup_drain(rx, want);
++		if (rd) {
++			for (unsigned i = 2; i < want && (i - 2) < rlen; ++i) {
++				rd[i - 2] = rx[i];
++			}
++		}
++	}
++	touch_wr(st.qup, QUP_OPERATIONAL, QUP_OUT_SVC_FLAG | QUP_IN_SVC_FLAG);
++	touch_wr(st.qup, QUP_I2C_STATUS, status & QUP_STATUS_ERR_MASK);
++	touch_wr(st.qup, QUP_ERROR_FLAGS, QUP_ERR_FLAGS_MASK);
++	if (!qup_state_set(QUP_STATE_RESET)) {
++		printf("SAGIT TOUCH: cannot return QUP to reset\n");
++		err = EIO;
++	}
++	if (err == EIO || err == ETIMEDOUT) {
++		printf("SAGIT TOUCH: i2c failure addr=%#x wr=%u rd=%u err=%d "
++		    "status=%#x op=%#x errs=%#x\n", addr, wlen, rlen, err,
++		    touch_rd(st.qup, QUP_I2C_STATUS),
++		    touch_rd(st.qup, QUP_OPERATIONAL),
++		    touch_rd(st.qup, QUP_ERROR_FLAGS));
++	}
++	return err;
++}
++
++/* ------------------------------------------------------------------ */
++/* DSX / RMI4 register access                                          */
++/* ------------------------------------------------------------------ */
++static bool
++dsx_set_page(unsigned page)
++{
++	uint8_t buf[2];
++
++	if (page == st.page) {
++		return true;
++	}
++	buf[0] = DSX_PAGE_SELECT_REG;
++	buf[1] = (uint8_t)page;
++	if (qup_msg(DSX_I2C_ADDR, buf, 2, NULL, 0)) {
++		return false;
++	}
++	st.page = page;
++	return true;
++}
++
++static int
++dsx_read_raw(uint16_t addr, uint8_t *buf, unsigned len)
++{
++	uint8_t reg = (uint8_t)(addr & 0xffu);
++
++	if (!dsx_set_page(addr >> 8)) {
++		return EIO;
++	}
++	return qup_msg(DSX_I2C_ADDR, &reg, 1, buf, len);
++}
++
++/* Chunked so a 0x50-byte F12 report still fits the QUP FIFO. */
++static int
++dsx_read(uint16_t addr, uint8_t *buf, unsigned len)
++{
++	unsigned done = 0;
++
++	while (done < len) {
++		unsigned n = len - done;
++
++		if (n > DSX_POLL_CHUNK) {
++			n = DSX_POLL_CHUNK;
++		}
++		int err = dsx_read_raw((uint16_t)(addr + done), buf + done, n);
++		if (err) {
++			return err;
++		}
++		done += n;
++	}
++	return 0;
++}
++
++static int
++dsx_write(uint16_t addr, const uint8_t *buf, unsigned len)
++{
++	uint8_t tmp[1 + 16];
++
++	if (len > 16) {
++		return EINVAL;
++	}
++	if (!dsx_set_page(addr >> 8)) {
++		return EIO;
++	}
++	tmp[0] = (uint8_t)(addr & 0xffu);
++	for (unsigned i = 0; i < len; ++i) {
++		tmp[1 + i] = buf[i];
++	}
++	return qup_msg(DSX_I2C_ADDR, tmp, len + 1, NULL, 0);
++}
++
++/* ------------------------------------------------------------------ */
++/* DSX bring-up: PDT, F01, F12                                         */
++/* ------------------------------------------------------------------ */
++struct dsx_pdt_entry {
++	uint8_t query_base, cmd_base, ctrl_base, data_base, fn_number, intr_count;
++};
++
++static bool
++dsx_reset_and_probe(void)
++{
++	uint8_t entry[DSX_PDT_ENTRY_SIZE];
++	uint8_t query[DSX_F01_QUERY_LEN];
++	unsigned intr_count = 0;
++	bool have_f01 = false, have_f12 = false;
++
++	st.page = 0xff; /* force a page-select write */
++	if (dsx_read_raw(DSX_PDT_START, entry, sizeof(entry))) {
++		printf("SAGIT TOUCH: no answer at i2c 0x%x (rail/clock/pull-up?)\n",
++		    DSX_I2C_ADDR);
++		return false;
++	}
++	printf("SAGIT TOUCH: pdt first entry %02x %02x %02x %02x fn=%02x intr=%u\n",
++	    entry[0], entry[1], entry[2], entry[3], entry[4], entry[5] & 7u);
++
++	for (unsigned i = 0, addr = DSX_PDT_START; i < DSX_PDT_MAX_ENTRIES;
++	    ++i, addr -= DSX_PDT_ENTRY_SIZE) {
++		struct dsx_pdt_entry e;
++
++		if (dsx_read_raw((uint16_t)addr, entry, sizeof(entry))) {
++			return false;
++		}
++		e.query_base = entry[0];
++		e.cmd_base = entry[1];
++		e.ctrl_base = entry[2];
++		e.data_base = entry[3];
++		e.fn_number = entry[4];
++		e.intr_count = entry[5] & 7u;
++		printf("SAGIT TOUCH: pdt %#x fn=%02x q=%#x cmd=%#x ctrl=%#x data=%#x "
++		    "intr=%u\n", addr, e.fn_number, e.query_base, e.cmd_base,
++		    e.ctrl_base, e.data_base, e.intr_count);
++		if (e.fn_number == 0) {
++			break;
++		}
++		if (e.fn_number != DSX_F34) {
++			intr_count += e.intr_count;
++		}
++		if (e.fn_number == DSX_F01) {
++			st.f01_query = e.query_base;
++			st.f01_cmd = e.cmd_base;
++			st.f01_ctrl = e.ctrl_base;
++			st.f01_data = e.data_base;
++			have_f01 = true;
++		} else if (e.fn_number == DSX_F12) {
++			st.f12_query = e.query_base;
++			st.f12_ctrl = e.ctrl_base;
++			st.f12_data = e.data_base;
++			have_f12 = true;
++		}
++	}
++	st.intr_regs = (intr_count + 7u) / 8u;
++	if (!st.intr_regs) {
++		st.intr_regs = 1;
++	}
++	if (!have_f01 || !have_f12) {
++		printf("SAGIT TOUCH: PDT incomplete (f01=%d f12=%d intr_regs=%u)\n",
++		    have_f01, have_f12, st.intr_regs);
++		return false;
++	}
++
++	if (dsx_read((uint16_t)st.f01_query, query, sizeof(query))) {
++		return false;
++	}
++	{
++		char product[11];
++
++		for (unsigned i = 0; i < 10; ++i) {
++			uint8_t c = query[11 + i];
++			product[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
++		}
++		product[10] = 0;
++		printf("SAGIT TOUCH: f01 manufacturer=%u product='%s' "
++		    "build=%02x%02x%02x intr_regs=%u\n", query[0], product,
++		    query[18], query[19], query[20], st.intr_regs);
++	}
++
++	/* F12: how many control registers precede ctrl 8 / ctrl 23. */
++	{
++		uint8_t q5[5], q7, q8[4], c23[2], c8[14];
++		unsigned ctrl8_off = 0, ctrl23_off = 0;
++		unsigned q8_len;
++
++		if (dsx_read((uint16_t)(st.f12_query + 5), q5, sizeof(q5))) {
++			return false;
++		}
++		ctrl8_off = (q5[1] & 1u) + ((q5[1] >> 1) & 1u) + ((q5[1] >> 2) & 1u) +
++		    ((q5[1] >> 3) & 1u) + ((q5[1] >> 4) & 1u) + ((q5[1] >> 5) & 1u) +
++		    ((q5[1] >> 6) & 1u) + ((q5[1] >> 7) & 1u);
++		ctrl23_off = ctrl8_off +
++		    (q5[2] & 1u) + ((q5[2] >> 1) & 1u) + ((q5[2] >> 2) & 1u) +
++		    ((q5[2] >> 3) & 1u) + ((q5[2] >> 4) & 1u) + ((q5[2] >> 5) & 1u) +
++		    ((q5[2] >> 6) & 1u) + ((q5[2] >> 7) & 1u) +
++		    (q5[3] & 1u) + ((q5[3] >> 1) & 1u) + ((q5[3] >> 2) & 1u) +
++		    ((q5[3] >> 3) & 1u) + ((q5[3] >> 4) & 1u) + ((q5[3] >> 5) & 1u) +
++		    ((q5[3] >> 6) & 1u);
++
++		if (dsx_read((uint16_t)(st.f12_ctrl + ctrl23_off), c23, sizeof(c23))) {
++			return false;
++		}
++		st.num_fingers = c23[1];
++		if (st.num_fingers > DSX_MAX_FINGERS) {
++			st.num_fingers = DSX_MAX_FINGERS;
++		}
++		if (!st.num_fingers) {
++			st.num_fingers = 2;
++		}
++		if (dsx_read((uint16_t)(st.f12_query + 7), &q7, 1)) {
++			return false;
++		}
++		q8_len = q7;
++		if (!q8_len || q8_len > sizeof(q8)) {
++			q8_len = sizeof(q8);
++		}
++		if (dsx_read((uint16_t)(st.f12_query + 8), q8, q8_len)) {
++			return false;
++		}
++		/* data0 present => the finger block starts one register later. */
++		st.data1_offset = q8[1] & 1u;
++		/* ctrl 8 holds the sensor maxima and the RX/TX counts. */
++		if (!dsx_read((uint16_t)(st.f12_ctrl + ctrl8_off), c8, sizeof(c8))) {
++			st.sensor_max_x = c8[0] | (c8[1] << 8);
++			st.sensor_max_y = c8[2] | (c8[3] << 8);
++		}
++		printf("SAGIT TOUCH: f12 ctrl8off=%u ctrl23off=%u fingers=%u "
++		    "data1off=%u q8=%02x%02x%02x max=%ux%u\n", ctrl8_off,
++		    ctrl23_off, st.num_fingers, st.data1_offset, q8[0], q8[1],
++		    q8[2], st.sensor_max_x, st.sensor_max_y);
++	}
++
++	/* F01 device status: 0x06 means the sensor is still checking its CRC. */
++	{
++		uint8_t status = 0;
++
++		for (unsigned i = 0; i < 20; ++i) {
++			if (dsx_read((uint16_t)st.f01_data, &status, 1)) {
++				return false;
++			}
++			if ((status & 0x0fu) != DSX_STATUS_CRC_BUSY) {
++				break;
++			}
++			touch_wait(20);
++		}
++		printf("SAGIT TOUCH: f01 status=%#x\n", status);
++	}
++
++	/* Tell the sensor the host is done configuring it (RMI4 "configured"). */
++	{
++		uint8_t ctrl = 0;
++
++		if (!dsx_read((uint16_t)st.f01_ctrl, &ctrl, 1)) {
++			if (!(ctrl & DSX_DEVICE_CTRL_CONFIGURED)) {
++				ctrl |= DSX_DEVICE_CTRL_CONFIGURED;
++				(void)dsx_write((uint16_t)st.f01_ctrl, &ctrl, 1);
++			}
++			printf("SAGIT TOUCH: f01 ctrl=%#x\n", ctrl);
++		}
++		/* Reading the interrupt status clears whatever ABL left latched. */
++		{
++			uint8_t intr[8] = { 0 };
++
++			if (st.intr_regs <= sizeof(intr)) {
++				(void)dsx_read((uint16_t)(st.f01_data + 1), intr,
++				    st.intr_regs);
++				st.last_intr = intr[0];
++			}
++		}
++	}
++
++	st.probed = true;
++	printf("SAGIT TOUCH: dsx ready, i2c 0x%x, poll %u ms, panel %ux%u\n",
++	    DSX_I2C_ADDR, st.poll_ms, st.sensor_max_x, st.sensor_max_y);
++	return true;
++}
++
++/* ------------------------------------------------------------------ */
++/* Report parsing -> HID digitizer                                     */
++/* ------------------------------------------------------------------ */
++static void
++touch_report(uint32_t mask, const int *x, const int *y)
++{
++	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
++		uint32_t bit = 1u << id;
++
++		if (mask & bit) {
++			if (!(st.active & bit) || x[id] != st.x[id] ||
++			    y[id] != st.y[id]) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++			}
++			st.x[id] = x[id];
++			st.y[id] = y[id];
++		} else if (st.active & bit) {
++			sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
++		}
++	}
++	st.active = mask;
++}
++
++static int
++dsx_read_report(void)
++{
++	uint8_t intr[8] = { 0 };
++	uint8_t buf[DSX_MAX_FINGERS * DSX_F12_FINGER_SIZE];
++	uint32_t mask = 0;
++	int x[TOUCH_MAX] = { 0 }, y[TOUCH_MAX] = { 0 };
++	unsigned nbytes = st.num_fingers * (unsigned)st.finger_size;
++
++	if (nbytes > sizeof(buf)) {
++		nbytes = sizeof(buf);
++	}
++	if (st.intr_regs <= sizeof(intr)) {
++		if (dsx_read((uint16_t)(st.f01_data + 1), intr, st.intr_regs)) {
++			return EIO;
++		}
++		st.last_intr = intr[0];
++	}
++	if (dsx_read((uint16_t)(st.f12_data + st.data1_offset), buf, nbytes)) {
++		return EIO;
++	}
++	if (st.debug >= 2 && st.logged_raw < 8) {
++		st.logged_raw++;
++		touch_memdump("report", (uint16_t)(st.f12_data + st.data1_offset),
++		    buf, nbytes < 32 ? nbytes : 32);
++	}
++	for (unsigned f = 0; f < st.num_fingers; ++f) {
++		const uint8_t *p = buf + f * (unsigned)st.finger_size;
++		unsigned status = p[0];
++
++		if (status != 0x01u) { /* F12_FINGER_STATUS only */
++			continue;
++		}
++		unsigned px = p[1] | (p[2] << 8);
++		unsigned py = p[3] | (p[4] << 8);
++
++		if (st.sensor_max_x && px > st.sensor_max_x) {
++			continue;
++		}
++		if (st.sensor_max_y && py > st.sensor_max_y) {
++			continue;
++		}
++		if (f >= TOUCH_MAX) {
++			continue;
++		}
++		if (st.scale_y && st.sensor_max_x && st.sensor_max_y) {
++			/* Debug: rescale into a different digitizer range. */
++			px = px * 1079u / st.sensor_max_x;
++			py = py * (unsigned)(st.scale_y - 1) / st.sensor_max_y;
++		}
++		mask |= 1u << f;
++		x[f] = (int)px;
++		y[f] = (int)py;
++	}
++	if (mask) {
++		st.reports++;
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* Thread                                                              */
++/* ------------------------------------------------------------------ */
++static void
++touch_thread(void *arg, wait_result_t result)
++{
++	unsigned probe_tries = 3;
++
++	(void)arg;
++	(void)result;
++	printf("SAGIT TOUCH: starting in %u s\n", st.delay_s);
++	touch_wait(st.delay_s * 1000u);
++
++	printf("SAGIT TOUCH: mapping QUP5/GCC/TLMM\n");
++	st.qup = ml_io_map(SGT_QUP5_PA, 0x1000);
++	st.gcc = ml_io_map(SGT_GCC_PA, 0x30000);
++	st.tlmm_n = ml_io_map(SGT_TLMM_N_PA, SGT_TLMM_N_SIZE);
++	st.tlmm_e = ml_io_map(SGT_TLMM_E_PA, SGT_TLMM_E_SIZE);
++	if (!st.qup || !st.gcc || !st.tlmm_n || !st.tlmm_e) {
++		printf("SAGIT TOUCH: MMIO mapping failed\n");
++		goto out;
++	}
++
++	/* The I2C pins first: without them every transfer just times out. */
++	printf("SAGIT TOUCH: pins before sda=%#x scl=%#x rst=%#x irq=%#x avdd=%#x\n",
++	    touch_rd(st.tlmm_e, TLMM_CFG(GPIO_TS_SDA)),
++	    touch_rd(st.tlmm_e, TLMM_CFG(GPIO_TS_SCL)),
++	    touch_rd(st.tlmm_e, TLMM_CFG(GPIO_TS_RESET)),
++	    touch_rd(st.tlmm_e, TLMM_CFG(GPIO_TS_IRQ)),
++	    touch_rd(st.tlmm_n, TLMM_CFG(GPIO_TS_AVDD_EN)));
++	touch_gpio(st.tlmm_e, GPIO_TS_SDA, TLMM_MUX_BLSP_I2C5, TLMM_PULL_NONE,
++	    TLMM_DRV_2MA, false, false);
++	touch_gpio(st.tlmm_e, GPIO_TS_SCL, TLMM_MUX_BLSP_I2C5, TLMM_PULL_NONE,
++	    TLMM_DRV_2MA, false, false);
++
++	/* disp_vddts_vreg: plain GPIO enable, active high, 4 ms startup. */
++	touch_gpio(st.tlmm_n, GPIO_TS_AVDD_EN, TLMM_MUX_GPIO, TLMM_PULL_NONE,
++	    TLMM_DRV_2MA, true, true);
++
++	/* Reset held low while the rails settle (synaptics,power-delay-ms = 5). */
++	touch_gpio(st.tlmm_e, GPIO_TS_RESET, TLMM_MUX_GPIO, TLMM_PULL_UP,
++	    TLMM_DRV_16MA, true, false);
++	touch_gpio(st.tlmm_e, GPIO_TS_IRQ, TLMM_MUX_GPIO, TLMM_PULL_UP,
++	    TLMM_DRV_16MA, false, false);
++	touch_wait(5);
++
++	if (!touch_clocks()) {
++		goto out;
++	}
++	if (!qup_init()) {
++		goto out;
++	}
++
++	/* reset-active-ms = 5, reset-delay-ms = 200. */
++	touch_gpio(st.tlmm_e, GPIO_TS_RESET, TLMM_MUX_GPIO, TLMM_PULL_UP,
++	    TLMM_DRV_16MA, true, false);
++	touch_wait(5);
++	touch_gpio(st.tlmm_e, GPIO_TS_RESET, TLMM_MUX_GPIO, TLMM_PULL_UP,
++	    TLMM_DRV_16MA, true, true);
++	touch_wait(200);
++
++	printf("SAGIT TOUCH: released reset, irq=%u, probing\n",
++	    touch_rd(st.tlmm_e, TLMM_IO(GPIO_TS_IRQ)) & 1u);
++
++	while (!st.probed && probe_tries--) {
++		if (dsx_reset_and_probe()) {
++			break;
++		}
++		touch_wait(300);
++	}
++	if (!st.probed) {
++		printf("SAGIT TOUCH: no DSX; giving up "
++		    "(mi6/docs/4k/touch-sagit.md 5.4)\n");
++		goto out;
++	}
++
++	while (!st.dead) {
++		int err = dsx_read_report();
++
++		st.polls++;
++		if (err) {
++			if ((st.errors++ % 100u) == 0) {
++				printf("SAGIT TOUCH: report err=%d polls=%u "
++				    "intr=%#x\n", err, st.polls, st.last_intr);
++			}
++			if (st.errors == 10) {
++				touch_report(0, st.x, st.y);
++			}
++			if (st.errors >= 100) {
++				printf("SAGIT TOUCH: 100 consecutive report "
++				    "errors, stopping\n");
++				st.dead = true;
++				break;
++			}
++		} else {
++			st.errors = 0;
++		}
++		if (st.debug && (st.polls % 100u) == 0) {
++			printf("SAGIT TOUCH: polls=%u reports=%u active=%#x "
++			    "intr=%#x irq=%u\n", st.polls, st.reports, st.active,
++			    st.last_intr, touch_rd(st.tlmm_e,
++			    TLMM_IO(GPIO_TS_IRQ)) & 1u);
++		}
++		touch_wait(st.poll_ms);
++	}
++	touch_report(0, st.x, st.y);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_touch_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++
++	if (st.started) {
++		return;
++	}
++	st.started = true;
++	st.poll_ms = 10;
++	st.delay_s = 30;
++	st.finger_size = DSX_F12_FINGER_SIZE;
++	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("sweettouchdelay", &st.delay_s,
++	    sizeof(st.delay_s));
++	(void)PE_parse_boot_argn("sweettouchpoll", &st.poll_ms,
++	    sizeof(st.poll_ms));
++	(void)PE_parse_boot_argn("sweettouchdebug", &st.debug,
++	    sizeof(st.debug));
++	(void)PE_parse_boot_argn("sweettouchscale", &st.scale_y,
++	    sizeof(st.scale_y));
++	(void)PE_parse_boot_argn("sweettouchdsx", &st.finger_size,
++	    sizeof(st.finger_size));
++	{
++		int slow = 0;
++
++		(void)PE_parse_boot_argn("sweettouchslow", &slow, sizeof(slow));
++		st.slow_100k = (slow != 0);
++	}
++	if (!enabled) {
++		printf("SAGIT TOUCH: disabled (sweettouch=0)\n");
++		return;
++	}
++	if (st.poll_ms < 2 || st.poll_ms > 1000) {
++		st.poll_ms = 10;
++	}
++	if (st.delay_s > 600) {
++		st.delay_s = 600;
++	}
++	if (st.finger_size < 5 || st.finger_size > 16) {
++		st.finger_size = DSX_F12_FINGER_SIZE;
++	}
++	printf("SAGIT TOUCH: enabled delay=%us poll=%ums debug=%u scale=%d "
++	    "finger_size=%d bus=%s\n", st.delay_s, st.poll_ms, st.debug,
++	    st.scale_y, st.finger_size, st.slow_100k ? "100kHz" : "400kHz");
++	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SAGIT TOUCH: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SAGIT */
