@@ -1,0 +1,68 @@
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index d20e026..1e146e2 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -384,6 +384,18 @@ private:
+ 	IOTimerEventSource *fTest;
+ 	UInt32 fTestSecs;
+ 	UInt32 fTestCount;
++	/*
++	 * sweetswipeauto=<secs>: repeat the synthetic unlock gesture forever.
++	 * The one-shot sweethome/sweetswipe thread in SweetHIDTouch waits on a
++	 * 100 ms delay loop, which is too slow on this machine (the CommCenter
++	 * crash loop starves it), so the lock screen can be missed entirely.
++	 * An IOTimerEventSource fires on the HID workloop with tick accuracy and
++	 * keeps trying until the screen is actually unlocked.
++	 */
++	static void autoUnlockFired(OSObject *owner, IOTimerEventSource *sender);
++	IOTimerEventSource *fAutoUnlock;
++	UInt32 fAutoUnlockSecs;
++	UInt32 fAutoUnlockTicks;
+ };
+ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+ 
+@@ -438,6 +450,19 @@ SweetHIDButtons::start(IOService *provider)
+ 			fTest->setTimeoutMS(fTestSecs * 1000);
+ 		}
+ 	}
++	if (PE_parse_boot_argn("sweetswipeauto", &fAutoUnlockSecs, sizeof(fAutoUnlockSecs)) &&
++	    fAutoUnlockSecs) {
++		if (fAutoUnlockSecs < 5) {
++			fAutoUnlockSecs = 5;
++		}
++		fAutoUnlock = IOTimerEventSource::timerEventSource(this,
++		    &SweetHIDButtons::autoUnlockFired);
++		if (fAutoUnlock != NULL &&
++		    _hidWorkLoop->addEventSource(fAutoUnlock) == kIOReturnSuccess) {
++			fAutoUnlock->setTimeoutMS(fAutoUnlockSecs * 1000);
++			IOLog("SWEET HID: auto-unlock every %u s\n", (unsigned)fAutoUnlockSecs);
++		}
++	}
+ 	gSweetButtons = this;
+ 	registerService();
+ 	IOLog("SWEET HID: buttons registered (test every %u s)\n", fTestSecs);
+@@ -473,6 +498,24 @@ SweetHIDButtons::pressHome(void)
+ 	key(kHIDUsage_Csmr_Menu, false);
+ }
+ 
++void
++SweetHIDButtons::autoUnlockFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	SweetHIDButtons *self = (SweetHIDButtons *)owner;
++	UInt32 clients = (UInt32)(self->_clients ? self->_clients->getCount() : 0);
++
++	IOLog("SWEET HID: auto-unlock tick %u (touch=%d clients=%u)\n",
++	    (unsigned)++self->fAutoUnlockTicks, gSweetTouch != NULL, (unsigned)clients);
++	/*
++	 * The gesture is only meaningful once backboardd reads our events; the
++	 * timer keeps running regardless so a late lock screen is still caught.
++	 */
++	if (gSweetTouch != NULL && clients != 0) {
++		gSweetTouch->swipeUp();
++	}
++	sender->setTimeoutMS(self->fAutoUnlockSecs * 1000);
++}
++
+ void
+ SweetHIDButtons::testFired(OSObject *owner, IOTimerEventSource *sender)
+ {
