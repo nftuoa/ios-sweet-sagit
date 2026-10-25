@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index a62416c..53b4e03 100644
+index a62416c..19713d1 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -9,20 +9,32 @@
@@ -237,7 +237,7 @@ index a62416c..53b4e03 100644
  	fLock = IOLockAlloc();
  	fClients = OSArray::withCapacity(4);
  	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
-@@ -200,6 +319,22 @@ AppleCLCD::start(IOService *provider)
+@@ -200,6 +319,31 @@ AppleCLCD::start(IOService *provider)
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
@@ -247,20 +247,29 @@ index a62416c..53b4e03 100644
 +	 * fb+0x4f4/+0x4f8; IOMobileFramebufferGetCanvasSizes() then returns
 +	 * that pair as the second (last) entry, and
 +	 * CA::WindowServer::IOMFBDisplay::set_physical_and_canvas_sizes()
-+	 * takes the last entry as the canvas size.  Publish it on both the
-+	 * provider and ourselves so it does not depend on the ADT.
++	 * takes the last entry as the canvas size.
++	 *
++	 * TYPE MATTERS: _getEDTProperty() (0x1af224ac8) calls
++	 * CFDataGetLength()/CFDataGetBytes() on the property unconditionally,
++	 * so these two must be CFData (OSData), not CFNumber.  Publishing
++	 * them as numbers makes CFDataGetLength() send -length to the
++	 * bridged __NSCFNumber and backboardd dies in IOMobileFramebufferOpen
++	 * with "-[__NSCFNumber length]: unrecognized selector".
++	 * The value is a host-endian 32-bit little-endian word.
 +	 */
++	uint32_t canvasWidth = fLogicalW;
++	uint32_t canvasHeight = fLogicalH;
 +	if (provider != NULL) {
-+		provider->setProperty("canvas-width", (unsigned long long)fLogicalW, 32);
-+		provider->setProperty("canvas-height", (unsigned long long)fLogicalH, 32);
++		provider->setProperty("canvas-width", (void *)&canvasWidth, sizeof(canvasWidth));
++		provider->setProperty("canvas-height", (void *)&canvasHeight, sizeof(canvasHeight));
 +	}
-+	setProperty("canvas-width", (unsigned long long)fLogicalW, 32);
-+	setProperty("canvas-height", (unsigned long long)fLogicalH, 32);
++	setProperty("canvas-width", (void *)&canvasWidth, sizeof(canvasWidth));
++	setProperty("canvas-height", (void *)&canvasHeight, sizeof(canvasHeight));
 +	sweet_fb_set_refresh_property(this, fRefreshHz);
  	registerService();
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
-@@ -471,6 +606,34 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+@@ -471,6 +615,34 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
  
  static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
  
@@ -295,7 +304,7 @@ index a62416c..53b4e03 100644
  IOReturn
  IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
      __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
-@@ -480,6 +643,13 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -480,6 +652,13 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  	uint64_t out[2] = { 0, 0 };
  	uint32_t outCount = 0;
  
@@ -309,7 +318,7 @@ index a62416c..53b4e03 100644
  	switch (selector) {
  	case kSweetFBGetLayerDefaultSurface:
  		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
-@@ -507,18 +677,76 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -507,18 +686,76 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  		outCount = 1;
  		break;
  	case kSweetFBGetDisplaySize:
@@ -390,7 +399,7 @@ index a62416c..53b4e03 100644
  	case kSweetFBNotifications:
  		if (args->scalarInputCount >= 3 && args->scalarInput[2] < SWEET_FB_NOTIFY_TYPES) {
  			uint32_t type = (uint32_t)args->scalarInput[2];
-@@ -553,9 +781,6 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -553,9 +790,6 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
  		args->scalarOutput[i] = i < outCount ? out[i] : 0;
  	}
