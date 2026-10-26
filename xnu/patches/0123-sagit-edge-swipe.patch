@@ -1,0 +1,43 @@
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 1e146e2..7d168a8 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -686,16 +686,33 @@ SweetHIDTouch::swipeUp(void)
+ {
+ 	const int steps = 8;
+ 	int x = panelCoord(500, true);
+-	int y0 = panelCoord(850, false);
+-	int y1 = panelCoord(150, false);
++	/*
++	 * The system home gesture only starts inside the bottom edge band
++	 * (backboardd's recognizer wants the touch to begin within ~50 px of the
++	 * bottom and carries kIOHIDEventOptionFromEdgeTip).  Starting at 85% of
++	 * the panel was outside that band, so the gesture was ignored.
++	 */
++	int y0 = panelCoord(980, false);
++	int y1 = panelCoord(100, false);
++
++	/*
++	 * A tap first: on a device with no passcode the lock screen still needs
++	 * an interaction to acknowledge, and the tap also makes sure the panel
++	 * is not in its dimmed state when the drag begins.
++	 */
++	touch(0, true, x, panelCoord(500, false));
++	sweetHIDDelayMS(30);
++	touch(0, false, x, panelCoord(500, false));
++	sweetHIDDelayMS(120);
+ 
+-	IOLog("SWEET HID: synthetic swipe %d,%d -> %d,%d (%d moves)\n", x, y0, x, y1, steps);
++	IOLog("SWEET HID: synthetic swipe %d,%d -> %d,%d (%d moves, edge start)\n",
++	    x, y0, x, y1, steps);
+ 	touch(0, true, x, y0);
+ 	for (int i = 1; i <= steps; i++) {
+-		sweetHIDDelayMS(20);
++		sweetHIDDelayMS(12);
+ 		touch(0, true, x, y0 + (y1 - y0) * i / steps);
+ 	}
+-	sweetHIDDelayMS(20);
++	sweetHIDDelayMS(12);
+ 	touch(0, false, x, y1);
+ }
+ 
