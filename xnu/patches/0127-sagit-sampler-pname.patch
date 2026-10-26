@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index 87862bd..6ef8ee3 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -82,8 +82,16 @@ extern void sweet_sample_task(const char *name, int pid, task_t task);  /* osfmk
+ static int
+ sweet_sample_proc(proc_t p, __unused void *arg)
+ {
+-	char name[32];
+-	proc_name(proc_pid(p), name, sizeof(name));
++	/*
++	 * proc_name() copies p_comm, which is MAXCOMLEN (16) bytes and therefore
++	 * truncates launchd job labels ("com.apple.datami", "com.apple.migra",
++	 * or plain "xpcproxy"), so the sampler could never match a daemon by its
++	 * label.  p_name is 2*MAXCOMLEN+1 bytes and holds the full name that
++	 * proc_selfname() shows.
++	 */
++	char name[2 * MAXCOMLEN + 1];
++
++	strlcpy(name, p->p_name, sizeof(name));
+ 	if (sweet_sample_wanted(name)) {
+ 		task_t task = proc_task(p);
+ 		if (task != TASK_NULL) {
