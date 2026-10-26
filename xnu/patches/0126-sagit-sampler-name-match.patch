@@ -1,0 +1,26 @@
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index b40eccd..aab574b 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -36,6 +36,21 @@ sweet_sample_wanted(const char *name)
+ 		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
+ 			return true;
+ 		}
++		/*
++		 * Also accept a substring match in either direction: a launchd
++		 * daemon's comm may be the job label ("com.apple.datamigrator") or
++		 * the executable name ("datamigrator"), and hard-coding both
++		 * spellings in a 128-byte boot-arg does not scale.
++		 */
++		if (tl > 0 && n > 0) {
++			char tok[64];
++			size_t copy = tl < sizeof(tok) - 1 ? tl : sizeof(tok) - 1;
++			memcpy(tok, t, copy);
++			tok[copy] = 0;
++			if (strstr(name, tok) != NULL || strstr(tok, name) != NULL) {
++				return true;
++			}
++		}
+ 		if (!end) {
+ 			break;
+ 		}

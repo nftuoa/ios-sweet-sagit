@@ -1,0 +1,47 @@
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index 3bf2d1f..066fef9 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -237,6 +237,42 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		args->scalarOutputCount = 0;
+ 		ret = sweet_aks_device_state(args);
+ 		break;
++	case kAKSWrapKey: {
++		/*
++		 * aks_wrap_key: securityd wraps a 32-byte key with the (nonexistent)
++		 * SEP key and stores the 40-byte blob.  Without a SEP there is
++		 * nothing to wrap with, so round-trip it: copy the key into the
++		 * caller's blob and report the blob size.  kAKSUnwrapKey reverses
++		 * this exactly, so a wrap/unwrap round trip still yields the
++		 * original key.  DataMigration's KeychainMigrator goes through
++		 * securityd and this was the last AKS selector still failing.
++		 */
++		if (args->structureInput == NULL || args->structureInputSize < 32 ||
++		    args->structureOutput == NULL || args->structureOutputSize < 40) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		bzero(args->structureOutput, args->structureOutputSize);
++		memcpy(args->structureOutput, args->structureInput, 32);
++		if (out_scalars >= 1) {
++			args->scalarOutput[0] = 40;
++			args->scalarOutputCount = 1;
++		}
++		break;
++	}
++	case kAKSUnwrapKey:
++		/* Reverse of kAKSWrapKey: the first 32 bytes are the key. */
++		if (args->structureInput == NULL || args->structureInputSize < 40 ||
++		    args->structureOutput == NULL || args->structureOutputSize < 32) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		memcpy(args->structureOutput, args->structureInput, 32);
++		if (out_scalars >= 1) {
++			args->scalarOutput[0] = 32;
++			args->scalarOutputCount = 1;
++		}
++		break;
+ 	case kAKSGetInternalInfo:
+ 		/*
+ 		 * aks_get_internal_info: one scalar in, a caller-sized info blob
