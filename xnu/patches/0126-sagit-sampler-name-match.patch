@@ -1,8 +1,32 @@
 diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
-index b40eccd..aab574b 100644
+index b40eccd..87862bd 100644
 --- a/bsd/dev/sweet_sample.c
 +++ b/bsd/dev/sweet_sample.c
-@@ -36,6 +36,21 @@ sweet_sample_wanted(const char *name)
+@@ -26,6 +26,23 @@ extern void sweet_sample_start(void);
+ 
+ static char sweet_sample_names[128];
+ 
++/* Plain substring search: XNU's libkern has no strstr(). */
++static bool
++sweet_sample_contains(const char *hay, const char *needle)
++{
++	size_t nl = strlen(needle);
++
++	if (nl == 0) {
++		return true;
++	}
++	for (const char *h = hay; *h; h++) {
++		if (strncmp(h, needle, nl) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ static bool
+ sweet_sample_wanted(const char *name)
+ {
+@@ -36,6 +53,22 @@ sweet_sample_wanted(const char *name)
  		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
  			return true;
  		}
@@ -17,7 +41,8 @@ index b40eccd..aab574b 100644
 +			size_t copy = tl < sizeof(tok) - 1 ? tl : sizeof(tok) - 1;
 +			memcpy(tok, t, copy);
 +			tok[copy] = 0;
-+			if (strstr(name, tok) != NULL || strstr(tok, name) != NULL) {
++			if (sweet_sample_contains(name, tok) ||
++			    sweet_sample_contains(tok, name)) {
 +				return true;
 +			}
 +		}
