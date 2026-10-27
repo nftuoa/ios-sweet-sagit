@@ -1,0 +1,412 @@
+diff --git a/bsd/dev/sweet_touch_sagit.c b/bsd/dev/sweet_touch_sagit.c
+index 6af01c7..09eed08 100644
+--- a/bsd/dev/sweet_touch_sagit.c
++++ b/bsd/dev/sweet_touch_sagit.c
+@@ -22,6 +22,11 @@
+  *     "disp_vddts_vreg" (TLMM GPIO 50, active high) is driven high, because
+  *     that one is a plain GPIO. If the DSX NACKs, the log says so and the
+  *     rail question is the next thing to chase.
++ *   - clocks: BLSP1 AHB is an APCS-voted local_vote_clk (GCC 0x52004
++ *     bit 17), not an RPM vote and not a CBCR enable; QUP5 I2C apps is a
++ *     branch under its own RCG. Both are polled and logged step by step in
++ *     touch_clocks(), and neither failure is fatal: the probe runs anyway
++ *     because ABL may have left the bus clocked. Details in the GCC block.
+  *   - the finger record size (8 bytes: status, x, y, z, wx, wy) is what the
+  *     vendor driver compiles in (REPORT_2D_Z + REPORT_2D_W); the raw report
+  *     is hex-dumped at sweettouchdebug=2 so it can be confirmed on hardware.
+@@ -50,6 +55,7 @@ void sweet_touch_init(void);
+ #define SGT_QUP5_PA     0x0c179000u
+ /* qcom,gcc@100000: reg = <0x100000 0xb0000>.                           */
+ #define SGT_GCC_PA      0x00100000u
++#define SGT_GCC_SIZE    0x000b0000u   /* 0x52004 (APCS vote) needs the lot */
+ /* pinctrl@03400000, 0xc00000: MSPM tiles NORTH +0x500000, EAST +0x900000. */
+ #define SGT_TLMM_N_PA   0x03900000u
+ #define SGT_TLMM_E_PA   0x03d00000u
+@@ -76,11 +82,80 @@ void sweet_touch_init(void);
+ #define GPIO_TS_RESET    89    /* synaptics,reset-gpio = <&tlmm 0x59 0>     */
+ #define GPIO_TS_IRQ      125   /* synaptics,irq-gpio = <&tlmm 0x7d 0x2008>  */
+ 
+-/* GCC clock branch registers (msm-clocks-hwio-8998.h). */
++/* ------------------------------------------------------------------ */
++/* GCC clocks: offsets from msm-clocks-hwio-8998.h, semantics from      */
++/* clock-gcc-8998.c / clock-local2.c (sagit-o-oss, legacy MSM clk driver) */
++/* ------------------------------------------------------------------ */
++/*
++ * 1. gcc_blsp1_ahb_clk is a *local_vote_clk* (clock-gcc-8998.c:1218):
++ *      .cbcr_reg = GCC_BLSP1_AHB_CBCR,
++ *      .bcr_reg  = GCC_BLSP1_BCR,
++ *      .vote_reg = GCC_APCS_CLOCK_BRANCH_ENA_VOTE, .en_mask = BIT(17)
++ *    local_vote_clk_enable() writes the *vote* register and then polls the
++ *    CBCR halt bits; it never writes the CBCR. So CBCR 0x17004 is status
++ *    only - bits[31:28] = 0x0 (on), 0x2 (on, NOC FSM) or 0x8 (halted).
++ *    The old code wrote 0x1 to that CBCR, which enables nothing: the first
++ *    boot read 0x8000c220 before and 0x80000000 after the write, i.e. still
++ *    halted, hence "blsp1_ahb clock did not come up (0x80000000)".
++ *    There is no parent RCG for it; there is a block reset, BCR 0x17000
++ *    bit 0 (BLK_ARES), which has to be deasserted.
++ *
++ * 2. gcc_blsp1_qup5_i2c_apps_clk is a plain *branch_clk*
++ *    (clock-gcc-8998.c:1327): CBCR 0x21008 bit 0 = enable, bits[31:28] =
++ *    halt status. Its RCG (CMD_RCGR 0x21020, CFG_RCGR 0x21024) must run:
++ *    the vendor's i2c-msm-v2 probe does clk_set_rate(core_clk,
++ *    qcom,clk-freq-in = 19.2 MHz), and set_rate_hid() puts that in CFG_RCGR
++ *    as src_sel 0 (CXO) with div field 1 (FIXDIV(1) = 2*1-1, i.e. /1).
++ *    Then: CMD_RCGR.UPDATE (bit 0) self-clears, CMD_RCGR.ROOT_EN (bit 1)
++ *    is set, and ROOT_OFF (bit 31) must read 0.
++ *    RCGR = 0x80000000 in the first boot log only means "root off, no
++ *    branch enabled yet" - it was never the reason the driver stopped.
++ *
++ * 3. Neither clock is RPM-voted on MSM8998: clock-gcc-8998.c's RPM tree
++ *    (DEFINE_CLK_RPM_SMD: CXO, BIMC, CNOC, SNOC, CNOC_PERIPH) does not
++ *    contain them; BLSP1 AHB is APCS-voted and 0x52004 is a plain GCC
++ *    register the AP may write. If the vote does not clear the halt bits,
++ *    BLSP1 is held off outside GCC (RPM/CX power collapse) - the driver
++ *    says so in the log and probes the bus anyway, because ABL may have
++ *    left it clocked.
++ *
++ * 4. No separate "QUP5 core" clock exists: the board DT gives i2c@c179000
++ *    exactly two clocks, "iface_clk" (BLSP1 AHB) and "core_clk" (QUP5 I2C
++ *    apps), and i2c-msm-v2 clk_get()s only those two. The QUP5 register
++ *    block is the DT's reg = <0xc179000 0x600>.
++ *
++ * 0x52004 is why the GCC mapping has to be 0xb0000 (the DT size), not the
++ * 0x30000 the first version mapped.
++ */
++#define GCC_BLSP1_BCR             0x17000u
+ #define GCC_BLSP1_AHB_CBCR        0x17004u
+ #define GCC_BLSP1_QUP5_APPS_CBCR  0x21008u
+ #define GCC_BLSP1_QUP5_APPS_RCGR  0x21020u
+-#define GCC_CBCR_CLK_OFF          (1u << 31)
++#define GCC_BLSP1_QUP5_APPS_CFG   0x21024u
++#define GCC_APCS_BRANCH_ENA_VOTE  0x52004u
++#define GCC_APCS_BLSP1_AHB_VOTE   (1u << 17)  /* gcc_blsp1_ahb_clk en_mask */
++/* 0x52008 is the matching sleep vote. The vendor clock driver never writes
++ * it for this clock (local_vote_clk_enable() only touches ENA_VOTE), so it
++ * is read for diagnostics only and not set here. */
++#define GCC_APCS_BRANCH_SLEEP_VOTE 0x52008u
++
++#define GCC_BCR_BLK_ARES          (1u << 0)
++
++#define GCC_CBCR_EN               (1u << 0)   /* branch_clk enable */
++#define GCC_CBCR_HW_CTL           (1u << 1)   /* hw handshake gating */
++#define GCC_CBCR_CLK_OFF          (1u << 31)  /* == HALT_OFF, kept for logs */
++#define GCC_CBCR_HALT_MASK        0xf0000000u /* bits[31:28] */
++#define GCC_CBCR_HALT_ON          0x00000000u
++#define GCC_CBCR_HALT_ON_NOC      0x20000000u
++#define GCC_CBCR_HALT_OFF         0x80000000u
++
++#define GCC_CMD_UPDATE            (1u << 0)
++#define GCC_CMD_ROOT_EN           (1u << 1)
++#define GCC_CMD_ROOT_OFF          (1u << 31)
++
++#define GCC_CFG_DIV_MASK          0x0000001fu
++#define GCC_CFG_SRC_SEL_MASK      0x00000700u
++#define GCC_CFG_XO_DIV1           0x00000001u /* src_sel 0 (CXO), /1 = 19.2 MHz */
+ 
+ /* ------------------------------------------------------------------ */
+ /* QUP v2.2.1 registers (sagit-o-oss include/linux/i2c/i2c-msm-v2.h)    */
+@@ -283,41 +358,227 @@ touch_gpio(vm_offset_t base, unsigned pin, unsigned mux, unsigned pull,
+ 	touch_wr(base, off, cfg);
+ }
+ 
++/* One decoded line per touch pin so the log can be compared with
++ * pinctrl-msm8998.c and the stock DTB without a calculator: mux is
++ * bits[4:2], pull bits[1:0], drive bits[8:6] (2 mA * (n + 1)), output
++ * enable bit 9, and the IO register's bit 0 is the pin level. */
++static void
++touch_pins_log(const char *when)
++{
++	static const struct {
++		const char *name;
++		bool north;
++		unsigned pin;
++	} pin[] = {
++		{ "sda", false, GPIO_TS_SDA },
++		{ "scl", false, GPIO_TS_SCL },
++		{ "rst", false, GPIO_TS_RESET },
++		{ "irq", false, GPIO_TS_IRQ },
++		{ "avdd", true, GPIO_TS_AVDD_EN },
++	};
++	static const char * const pull[] = { "none", "down", "keep", "up" };
++	static const char * const drv[] = { "2", "4", "6", "8", "10", "12",
++	    "14", "16" };
++
++	for (unsigned i = 0; i < sizeof(pin) / sizeof(pin[0]); ++i) {
++		vm_offset_t base = pin[i].north ? st.tlmm_n : st.tlmm_e;
++		uint32_t cfg = touch_rd(base, TLMM_CFG(pin[i].pin));
++		uint32_t io = touch_rd(base, TLMM_IO(pin[i].pin));
++
++		printf("SAGIT TOUCH: pin %s %s(gpio%u) mux=%u pull=%s "
++		    "drive=%smA %s level=%u cfg=%#x\n", when, pin[i].name,
++		    pin[i].pin, (cfg >> 2) & 7u, pull[cfg & 3u],
++		    drv[(cfg >> 6) & 7u], (cfg & TLMM_OE) ? "out" : "in",
++		    io & 1u, cfg);
++	}
++}
++
+ /* ------------------------------------------------------------------ */
+ /* GCC clocks                                                          */
+ /* ------------------------------------------------------------------ */
++/* CBCR halt status is bits[31:28]: 0x0 = on, 0x2 = on (NOC FSM), 0x8 =
++ * halted (clock-local2.c BRANCH_ON_VAL / BRANCH_NOC_FSM_ON_VAL /
++ * BRANCH_OFF_VAL). Only the top nibble is looked at, so a write that
++ * clears other status bits (the old CBCR write did) is not mistaken for
++ * progress. */
++static bool
++gcc_branch_running(uint32_t cbcr)
++{
++	uint32_t halt = cbcr & GCC_CBCR_HALT_MASK;
++
++	return halt == GCC_CBCR_HALT_ON || halt == GCC_CBCR_HALT_ON_NOC;
++}
++
++/* Poll a CBCR until the branch reports running; return the last read. */
++static uint32_t
++gcc_wait_branch(uint32_t off, unsigned ms)
++{
++	uint32_t v = touch_rd(st.gcc, off);
++
++	for (unsigned i = 0; i < ms * 1000u; ++i) {
++		if (gcc_branch_running(v)) {
++			break;
++		}
++		delay(1);
++		v = touch_rd(st.gcc, off);
++	}
++	return v;
++}
++
++/* CMD_RCGR.UPDATE self-clears once the RCG has taken the new config. */
++static uint32_t
++gcc_rcg_update(uint32_t cmd_off)
++{
++	touch_wr(st.gcc, cmd_off, touch_rd(st.gcc, cmd_off) | GCC_CMD_UPDATE);
++	(void)touch_poll_clear(st.gcc, cmd_off, GCC_CMD_UPDATE, 5);
++	return touch_rd(st.gcc, cmd_off);
++}
++
++/* CMD_RCGR.ROOT_OFF (bit 31) clears once the root generates a clock. */
++static uint32_t
++gcc_wait_root(uint32_t cmd_off, unsigned ms)
++{
++	uint32_t v = touch_rd(st.gcc, cmd_off);
++
++	for (unsigned i = 0; i < ms * 1000u; ++i) {
++		if (!(v & GCC_CMD_ROOT_OFF)) {
++			break;
++		}
++		delay(1);
++		v = touch_rd(st.gcc, cmd_off);
++	}
++	return v;
++}
++
++/*
++ * Bring up gcc_blsp1_ahb_clk (APCS vote) and gcc_blsp1_qup5_i2c_apps_clk
++ * (RCG + branch), logging every register before and after its write so the
++ * next boot log pinpoints the step that did not take. Returns true only if
++ * both branches read back running; the caller probes the bus either way.
++ */
+ static bool
+ touch_clocks(void)
+ {
+-	static const struct {
+-		const char *name;
+-		uint32_t off;
+-	} cbcr[] = {
+-		{ "blsp1_ahb", GCC_BLSP1_AHB_CBCR },
+-		{ "qup5_i2c_apps", GCC_BLSP1_QUP5_APPS_CBCR },
+-	};
++	uint32_t reg, vote, cbcr, cfg, cmd;
++	bool ahb_ok, apps_ok;
+ 
+-	printf("SAGIT TOUCH: gcc ahb=%#x qup5=%#x rcgr=%#x\n",
++	printf("SAGIT TOUCH: gcc before: bcr=%#x ahb_cbcr=%#x vote=%#x "
++	    "qup5_cbcr=%#x cfg=%#x rcgr=%#x\n",
++	    touch_rd(st.gcc, GCC_BLSP1_BCR),
+ 	    touch_rd(st.gcc, GCC_BLSP1_AHB_CBCR),
++	    touch_rd(st.gcc, GCC_APCS_BRANCH_ENA_VOTE),
+ 	    touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_CBCR),
++	    touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_CFG),
+ 	    touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_RCGR));
+ 
+-	for (unsigned i = 0; i < sizeof(cbcr) / sizeof(cbcr[0]); ++i) {
+-		if (!(touch_rd(st.gcc, cbcr[i].off) & GCC_CBCR_CLK_OFF)) {
+-			continue; /* already running (ABL or another driver) */
+-		}
+-		touch_wr(st.gcc, cbcr[i].off, 1u); /* CBCR enable */
+-		if (!touch_poll_clear(st.gcc, cbcr[i].off, GCC_CBCR_CLK_OFF, 20)) {
+-			printf("SAGIT TOUCH: %s clock did not come up (%#x)\n",
+-			    cbcr[i].name, touch_rd(st.gcc, cbcr[i].off));
+-			return false;
+-		}
++	/* 1. BLSP1 block reset (BCR bit 0 = BLK_ARES). Asserted means every
++	 *    QUP5 register in the block reads garbage, so deassert it first;
++	 *    it is normally already deasserted by ABL. */
++	reg = touch_rd(st.gcc, GCC_BLSP1_BCR);
++	if (reg & GCC_BCR_BLK_ARES) {
++		touch_wr(st.gcc, GCC_BLSP1_BCR, reg & ~GCC_BCR_BLK_ARES);
++		printf("SAGIT TOUCH: blsp1 bcr %#x -> %#x (block reset "
++		    "deasserted)\n", reg, touch_rd(st.gcc, GCC_BLSP1_BCR));
++	} else {
++		printf("SAGIT TOUCH: blsp1 bcr=%#x (block reset already "
++		    "deasserted)\n", reg);
+ 	}
+-	printf("SAGIT TOUCH: clocks on, rcgr=%#x ahb=%#x qup5=%#x\n",
+-	    touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_RCGR),
++
++	/* 2. gcc_blsp1_ahb_clk: enable = APCS vote BIT(17) at 0x52004; the
++	 *    CBCR at 0x17004 is status only, writing it does nothing. */
++	cbcr = touch_rd(st.gcc, GCC_BLSP1_AHB_CBCR);
++	if (gcc_branch_running(cbcr)) {
++		printf("SAGIT TOUCH: blsp1_ahb already running, cbcr=%#x\n",
++		    cbcr);
++	} else {
++		vote = touch_rd(st.gcc, GCC_APCS_BRANCH_ENA_VOTE);
++		touch_wr(st.gcc, GCC_APCS_BRANCH_ENA_VOTE,
++		    vote | GCC_APCS_BLSP1_AHB_VOTE);
++		printf("SAGIT TOUCH: blsp1_ahb vote %#x -> %#x (BIT(17))\n",
++		    vote, touch_rd(st.gcc, GCC_APCS_BRANCH_ENA_VOTE));
++		cbcr = gcc_wait_branch(GCC_BLSP1_AHB_CBCR, 20);
++	}
++	ahb_ok = gcc_branch_running(cbcr);
++	if (ahb_ok) {
++		printf("SAGIT TOUCH: blsp1_ahb on, cbcr=%#x vote=%#x\n", cbcr,
++		    touch_rd(st.gcc, GCC_APCS_BRANCH_ENA_VOTE));
++	} else {
++		printf("SAGIT TOUCH: blsp1_ahb clock did not come up (%#x, "
++		    "vote=%#x)\n", cbcr,
++		    touch_rd(st.gcc, GCC_APCS_BRANCH_ENA_VOTE));
++		printf("SAGIT TOUCH: blsp1_ahb is APCS-vote gated, not "
++		    "RPM-voted: BIT(17) of %#x is its enable, the CBCR is "
++		    "status only. The vote did not take, so BLSP1 is held "
++		    "off outside GCC (RPM/CX power collapse) and no GCC "
++		    "write can fix it. Not faking an RPM vote; probing the "
++		    "bus anyway in case ABL left it clocked "
++		    "(sleep_vote=%#x).\n", GCC_APCS_BRANCH_ENA_VOTE,
++		    touch_rd(st.gcc, GCC_APCS_BRANCH_SLEEP_VOTE));
++	}
++
++	/* 3. QUP5 I2C apps RCG: 19.2 MHz from CXO. The vendor I2C probe does
++	 *    clk_set_rate(core_clk, clk-freq-in), so CFG_RCGR must read
++	 *    src_sel 0 (CXO) | div 1 (FIXDIV(1) = 2*1-1 = /1); the bus
++	 *    divider in QUP_I2C_CLK_CTL assumes exactly this 19.2 MHz. */
++	cfg = touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_CFG);
++	if ((cfg & (GCC_CFG_DIV_MASK | GCC_CFG_SRC_SEL_MASK)) !=
++	    GCC_CFG_XO_DIV1) {
++		touch_wr(st.gcc, GCC_BLSP1_QUP5_APPS_CFG,
++		    (cfg & ~(GCC_CFG_DIV_MASK | GCC_CFG_SRC_SEL_MASK)) |
++		    GCC_CFG_XO_DIV1);
++		printf("SAGIT TOUCH: qup5 cfg %#x -> %#x (CXO, /1 = 19.2 MHz)\n",
++		    cfg, touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_CFG));
++		cmd = gcc_rcg_update(GCC_BLSP1_QUP5_APPS_RCGR);
++		printf("SAGIT TOUCH: qup5 rcgr update done, rcgr=%#x\n", cmd);
++	} else {
++		printf("SAGIT TOUCH: qup5 cfg=%#x already CXO/1\n", cfg);
++	}
++
++	cmd = touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_RCGR);
++	if (!(cmd & GCC_CMD_ROOT_EN)) {
++		touch_wr(st.gcc, GCC_BLSP1_QUP5_APPS_RCGR,
++		    cmd | GCC_CMD_ROOT_EN);
++	}
++	cmd = gcc_wait_root(GCC_BLSP1_QUP5_APPS_RCGR, 5);
++	printf("SAGIT TOUCH: qup5 rcgr=%#x root %s\n", cmd,
++	    (cmd & GCC_CMD_ROOT_OFF) ? "still off" : "on");
++
++	/* 4. gcc_blsp1_qup5_i2c_apps_clk: plain branch, CBCR bit 0 = enable.
++	 *    HW_CTL (bit 1) is cleared so the software enable is what counts
++	 *    instead of the QUP's idle handshake (hw_ctl_clk_disable() in the
++	 *    vendor driver clears the same bit). */
++	cbcr = touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_CBCR);
++	if (!gcc_branch_running(cbcr)) {
++		uint32_t want = (cbcr & ~GCC_CBCR_HW_CTL) | GCC_CBCR_EN;
++
++		touch_wr(st.gcc, GCC_BLSP1_QUP5_APPS_CBCR, want);
++		printf("SAGIT TOUCH: qup5_apps cbcr %#x -> %#x\n", cbcr, want);
++		cbcr = gcc_wait_branch(GCC_BLSP1_QUP5_APPS_CBCR, 20);
++	}
++	apps_ok = gcc_branch_running(cbcr);
++	if (!apps_ok) {
++		printf("SAGIT TOUCH: qup5_apps clock did not come up (%#x, "
++		    "rcgr=%#x ahb=%#x)\n", cbcr,
++		    touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_RCGR),
++		    touch_rd(st.gcc, GCC_BLSP1_AHB_CBCR));
++	}
++
++	printf("SAGIT TOUCH: gcc after: bcr=%#x ahb_cbcr=%#x vote=%#x "
++	    "qup5_cbcr=%#x cfg=%#x rcgr=%#x\n",
++	    touch_rd(st.gcc, GCC_BLSP1_BCR),
+ 	    touch_rd(st.gcc, GCC_BLSP1_AHB_CBCR),
+-	    touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_CBCR));
+-	return true;
++	    touch_rd(st.gcc, GCC_APCS_BRANCH_ENA_VOTE),
++	    touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_CBCR),
++	    touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_CFG),
++	    touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_RCGR));
++	if (ahb_ok && apps_ok) {
++		printf("SAGIT TOUCH: clocks on, rcgr=%#x ahb=%#x qup5=%#x\n",
++		    touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_RCGR),
++		    touch_rd(st.gcc, GCC_BLSP1_AHB_CBCR),
++		    touch_rd(st.gcc, GCC_BLSP1_QUP5_APPS_CBCR));
++		return true;
++	}
++	return false;
+ }
+ 
+ /* ------------------------------------------------------------------ */
+@@ -935,7 +1196,7 @@ touch_thread(void *arg, wait_result_t result)
+ 
+ 	printf("SAGIT TOUCH: mapping QUP5/GCC/TLMM\n");
+ 	st.qup = ml_io_map(SGT_QUP5_PA, 0x1000);
+-	st.gcc = ml_io_map(SGT_GCC_PA, 0x30000);
++	st.gcc = ml_io_map(SGT_GCC_PA, SGT_GCC_SIZE);
+ 	st.tlmm_n = ml_io_map(SGT_TLMM_N_PA, SGT_TLMM_N_SIZE);
+ 	st.tlmm_e = ml_io_map(SGT_TLMM_E_PA, SGT_TLMM_E_SIZE);
+ 	if (!st.qup || !st.gcc || !st.tlmm_n || !st.tlmm_e) {
+@@ -950,6 +1211,13 @@ touch_thread(void *arg, wait_result_t result)
+ 	    touch_rd(st.tlmm_e, TLMM_CFG(GPIO_TS_RESET)),
+ 	    touch_rd(st.tlmm_e, TLMM_CFG(GPIO_TS_IRQ)),
+ 	    touch_rd(st.tlmm_n, TLMM_CFG(GPIO_TS_AVDD_EN)));
++	touch_pins_log("before");
++
++	/* 87/88: function blsp_i2c5. pinctrl-msm8998.c PINGROUP(87, EAST,
++	 * blsp_spi5, blsp_uart2_b, blsp_i2c5, ...) lists funcs as
++	 * {gpio,spi5,uart2_b,i2c5}, and pinctrl-msm writes the index in that
++	 * array, so blsp_i2c5 = 3. The board DTB's i2c_5_active asks for
++	 * drive-strength 2 and bias-disable = pull none, input. */
+ 	touch_gpio(st.tlmm_e, GPIO_TS_SDA, TLMM_MUX_BLSP_I2C5, TLMM_PULL_NONE,
+ 	    TLMM_DRV_2MA, false, false);
+ 	touch_gpio(st.tlmm_e, GPIO_TS_SCL, TLMM_MUX_BLSP_I2C5, TLMM_PULL_NONE,
+@@ -959,18 +1227,28 @@ touch_thread(void *arg, wait_result_t result)
+ 	touch_gpio(st.tlmm_n, GPIO_TS_AVDD_EN, TLMM_MUX_GPIO, TLMM_PULL_NONE,
+ 	    TLMM_DRV_2MA, true, true);
+ 
+-	/* Reset held low while the rails settle (synaptics,power-delay-ms = 5). */
++	/* Reset held low while the rails settle (synaptics,power-delay-ms = 5).
++	 * GPIO 89/125 are mux 0 (gpio) in PINGROUP(89, EAST, tsif1_clk, ...) /
++	 * PINGROUP(125, EAST, phase_flag24, ...), and the DTB's ts_active asks
++	 * for drive-strength 16 and bias-pull-up on both. */
+ 	touch_gpio(st.tlmm_e, GPIO_TS_RESET, TLMM_MUX_GPIO, TLMM_PULL_UP,
+ 	    TLMM_DRV_16MA, true, false);
+ 	touch_gpio(st.tlmm_e, GPIO_TS_IRQ, TLMM_MUX_GPIO, TLMM_PULL_UP,
+ 	    TLMM_DRV_16MA, false, false);
++	touch_pins_log("after");
+ 	touch_wait(5);
+ 
++	/* Clocks are never fatal: if a vote does not take, touch_clocks() says
++	 * so and the probe below still runs, because ABL may have left BLSP1
++	 * clocked and the first I2C transaction is the cheapest way to find
++	 * out whether the rail/clock/pull-up chain is alive. */
+ 	if (!touch_clocks()) {
+-		goto out;
++		printf("SAGIT TOUCH: clock bring-up incomplete, probing the "
++		    "I2C bus anyway\n");
+ 	}
+ 	if (!qup_init()) {
+-		goto out;
++		printf("SAGIT TOUCH: qup init failed (no clock?), probing "
++		    "the bus anyway\n");
+ 	}
+ 
+ 	/* reset-active-ms = 5, reset-delay-ms = 200. */
