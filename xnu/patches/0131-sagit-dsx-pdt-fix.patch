@@ -1,0 +1,594 @@
+diff --git a/bsd/dev/sweet_touch_sagit.c b/bsd/dev/sweet_touch_sagit.c
+index 09eed08..88002ac 100644
+--- a/bsd/dev/sweet_touch_sagit.c
++++ b/bsd/dev/sweet_touch_sagit.c
+@@ -231,16 +231,22 @@ void sweet_touch_init(void);
+ #define DSX_I2C_ADDR          0x20    /* reg = <0x20>                      */
+ #define DSX_UB_I2C_ADDR       0x2c    /* synaptics,ub-i2c-addr (fw update) */
+ #define DSX_PAGE_SELECT_REG   0xff
+-#define DSX_PDT_START         0x00e9
+-#define DSX_PDT_END           0x00d0
++#define DSX_PDT_START         0x00e9  /* synaptics_dsx PDT_START          */
++#define DSX_PDT_END           0x00d0  /* synaptics_dsx PDT_END            */
+ #define DSX_PDT_ENTRY_SIZE    6
+-#define DSX_PDT_MAX_ENTRIES   5
++#define DSX_PDT_MAX_ENTRIES   5       /* 0xe9 .. 0xd1                     */
++#define DSX_PDT_PAGES         10      /* synaptics_dsx PAGES_TO_SERVICE   */
+ #define DSX_F01               0x01
++#define DSX_F11               0x11
+ #define DSX_F12               0x12
++#define DSX_F1A               0x1a
+ #define DSX_F34               0x34
+ #define DSX_F01_QUERY_LEN     21
++#define DSX_F01_INTR_OFF      1       /* F01 ctrl+1 = interrupt enables   */
+ #define DSX_F12_FINGER_SIZE   8       /* status,x,y,z,wx,wy (REPORT_2D_Z/W) */
++#define DSX_F12_REPORT_ENABLE 0xffu   /* RPT_DEFAULT|RPT_Z|RPT_WX|RPT_WY  */
+ #define DSX_MAX_FINGERS       10
++#define DSX_MAX_INTR_REGS     4
+ #define DSX_STATUS_CRC_BUSY   0x06    /* F01 device status: CRC in progress  */
+ #define DSX_DEVICE_CTRL_CONFIGURED 0x80
+ #define DSX_POLL_CHUNK        16      /* report bytes per QUP read          */
+@@ -264,6 +270,7 @@ struct sagit_dsx {
+ 	unsigned f01_query, f01_cmd, f01_ctrl, f01_data;
+ 	unsigned f12_query, f12_ctrl, f12_data;
+ 	unsigned intr_regs;
++	uint8_t intr_mask[DSX_MAX_INTR_REGS];
+ 	unsigned num_fingers;
+ 	unsigned data1_offset;
+ 	unsigned sensor_max_x, sensor_max_y;
+@@ -274,6 +281,9 @@ struct sagit_dsx {
+ 	uint32_t active;
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+ 	unsigned polls, errors, reports, logged_raw;
++	unsigned intr_no_data;
++	bool report_logged;
++	bool intr_dumped;
+ 	uint32_t last_intr;
+ };
+ 
+@@ -917,139 +927,309 @@ dsx_write(uint16_t addr, const uint8_t *buf, unsigned len)
+ /* ------------------------------------------------------------------ */
+ /* DSX bring-up: PDT, F01, F12                                         */
+ /* ------------------------------------------------------------------ */
++/*
++ * One PDT entry, in the order this firmware (and both mainline rmi4 and
++ * Xiaomi's synaptics_dsx_force) lays it out:
++ *
++ *   byte 0  query base          byte 4  bits[2:0] = interrupt source count
++ *   byte 1  command base                 bits[6:5] = function version
++ *   byte 2  control base        byte 5  function number
++ *   byte 3  data base
++ *
++ * Synaptics' own struct spells this out as
++ *   query, cmd, ctrl, data, intr_src_count:3/reserved:2/fn_version:2, fn_number
++ * (sagit-o-oss synaptics_dsx_force/synaptics_dsx_core.c lines 152-167) and
++ * mainline rmi4 agrees:
++ *   entry->interrupt_source_count = buf[4] & RMI_PDT_INT_SOURCE_COUNT_MASK;
++ *   entry->function_version       = (buf[4] & RMI_PDT_FUNCTION_VERSION_MASK) >> 5;
++ *   entry->function_number        = buf[5];
++ * (linux drivers/input/rmi4/rmi_driver.c, rmi_parse_pdt_entry()).
++ *
++ * Reading byte 4 as the function number is what turned the real
++ * F34/F01/F12 table (byte 4 = 0x41/0x01/0x01, byte 5 = 0x34/0x01/0x12)
++ * into fn=0x41 followed by two fn=0x01 entries.
++ */
+ struct dsx_pdt_entry {
+-	uint8_t query_base, cmd_base, ctrl_base, data_base, fn_number, intr_count;
++	uint8_t query_base, cmd_base, ctrl_base, data_base;
++	uint8_t intr_count;           /* byte 4 bits[2:0]                     */
++	uint8_t version;              /* byte 4 bits[6:5]                     */
++	uint8_t fn_number;            /* byte 5                               */
+ };
+ 
+-static bool
+-dsx_reset_and_probe(void)
++static unsigned
++dsx_popcount8(uint8_t v)
+ {
+-	uint8_t entry[DSX_PDT_ENTRY_SIZE];
+-	uint8_t query[DSX_F01_QUERY_LEN];
+-	unsigned intr_count = 0;
+-	bool have_f01 = false, have_f12 = false;
++	unsigned n = 0;
+ 
+-	st.page = 0xff; /* force a page-select write */
+-	if (dsx_read_raw(DSX_PDT_START, entry, sizeof(entry))) {
+-		printf("SAGIT TOUCH: no answer at i2c 0x%x (rail/clock/pull-up?)\n",
+-		    DSX_I2C_ADDR);
+-		return false;
++	while (v) {
++		n += v & 1u;
++		v >>= 1;
+ 	}
+-	printf("SAGIT TOUCH: pdt first entry %02x %02x %02x %02x fn=%02x intr=%u\n",
+-	    entry[0], entry[1], entry[2], entry[3], entry[4], entry[5] & 7u);
++	return n;
++}
+ 
+-	for (unsigned i = 0, addr = DSX_PDT_START; i < DSX_PDT_MAX_ENTRIES;
+-	    ++i, addr -= DSX_PDT_ENTRY_SIZE) {
+-		struct dsx_pdt_entry e;
++/* Print one raw entry (ground truth for the next boot) and decode it. */
++static bool
++dsx_pdt_decode(uint16_t addr, const uint8_t *raw, struct dsx_pdt_entry *e)
++{
++	e->query_base = raw[0];
++	e->cmd_base = raw[1];
++	e->ctrl_base = raw[2];
++	e->data_base = raw[3];
++	e->intr_count = raw[4] & 0x07u;
++	e->version = (raw[4] >> 5) & 0x03u;
++	e->fn_number = raw[5];
++
++	printf("SAGIT TOUCH: pdt raw @%#x: %02x %02x %02x %02x %02x %02x\n",
++	    addr, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
++	if (e->fn_number == 0) {
++		return false;         /* end of this page's table */
++	}
++	printf("SAGIT TOUCH: pdt %#x fn=%02x v%u intr=%u q=%#x cmd=%#x "
++	    "ctrl=%#x data=%#x\n", addr, e->fn_number, e->version,
++	    e->intr_count, e->query_base, e->cmd_base, e->ctrl_base,
++	    e->data_base);
++	return true;
++}
+ 
+-		if (dsx_read_raw((uint16_t)addr, entry, sizeof(entry))) {
+-			return false;
+-		}
+-		e.query_base = entry[0];
+-		e.cmd_base = entry[1];
+-		e.ctrl_base = entry[2];
+-		e.data_base = entry[3];
+-		e.fn_number = entry[4];
+-		e.intr_count = entry[5] & 7u;
+-		printf("SAGIT TOUCH: pdt %#x fn=%02x q=%#x cmd=%#x ctrl=%#x data=%#x "
+-		    "intr=%u\n", addr, e.fn_number, e.query_base, e.cmd_base,
+-		    e.ctrl_base, e.data_base, e.intr_count);
+-		if (e.fn_number == 0) {
+-			break;
++/*
++ * Walk the PDT the way synaptics_rmi4_query_device() does: pages 0..9,
++ * entries from 0x00E9 down to 0x00D1 in 6-byte steps, stopping a page at
++ * fn_number 0.  Pages above 0 are only visited when page 0 did not give us
++ * both F01 and F12; the stock dmesg shows both there (F12 query 0x004c,
++ * control 0x0012), so a single page is the expected path.
++ *
++ * Interrupt bookkeeping follows the vendor too: every entry's intr_src_count
++ * is added to a running total (F34 included), and each function we
++ * understand claims its bits in the F01 interrupt-enable registers at
++ * `F01 ctrl + 1 + reg' (synaptics_rmi4_set_intr_mask()).
++ */
++static bool
++dsx_scan_pdt(void)
++{
++	uint8_t raw[DSX_PDT_ENTRY_SIZE];
++	struct dsx_pdt_entry f01, f12;
++	unsigned intr_total = 0;
++	bool have_f01 = false, have_f12 = false;
++	bool saw_f11 = false, saw_f1a = false;
++
++	memset(&f01, 0, sizeof(f01));
++	memset(&f12, 0, sizeof(f12));
++
++	for (unsigned page = 0; page < DSX_PDT_PAGES; ++page) {
++		bool page_empty = true;
++
++		for (unsigned i = 0, addr = DSX_PDT_START;
++		    addr > DSX_PDT_END && i < DSX_PDT_MAX_ENTRIES;
++		    ++i, addr -= DSX_PDT_ENTRY_SIZE) {
++			struct dsx_pdt_entry e;
++			uint16_t full = (uint16_t)((page << 8) | addr);
++
++			if (dsx_read_raw(full, raw, sizeof(raw))) {
++				if (page) {
++					/* a page we do not need is not fatal */
++					break;
++				}
++				printf("SAGIT TOUCH: no answer at i2c 0x%x "
++				    "(rail/clock/pull-up?)\n", DSX_I2C_ADDR);
++				return false;
++			}
++			if (!dsx_pdt_decode(full, raw, &e)) {
++				break;
++			}
++			page_empty = false;
++
++			if (e.fn_number == DSX_F01 || e.fn_number == DSX_F11 ||
++			    e.fn_number == DSX_F12 || e.fn_number == DSX_F1A) {
++				unsigned bit = intr_total % 8u;
++				unsigned reg = (intr_total + 7u) / 8u;
++
++				if (reg) {
++					reg--;
++				}
++				for (unsigned j = 0; j < e.intr_count; ++j) {
++					unsigned b = (bit + j) % 8u;
++					unsigned r = reg + (bit + j) / 8u;
++
++					if (r < DSX_MAX_INTR_REGS) {
++						st.intr_mask[r] |=
++						    (uint8_t)(1u << b);
++					}
++				}
++			}
++			intr_total += e.intr_count;
++
++			if (e.fn_number == DSX_F01) {
++				f01 = e;
++				have_f01 = true;
++			} else if (e.fn_number == DSX_F12) {
++				f12 = e;
++				have_f12 = true;
++			} else if (e.fn_number == DSX_F11) {
++				saw_f11 = true;
++			} else if (e.fn_number == DSX_F1A) {
++				saw_f1a = true;
++			}
+ 		}
+-		if (e.fn_number != DSX_F34) {
+-			intr_count += e.intr_count;
++		if (page_empty && page > 0) {
++			break;            /* nothing here and nothing above */
+ 		}
+-		if (e.fn_number == DSX_F01) {
+-			st.f01_query = e.query_base;
+-			st.f01_cmd = e.cmd_base;
+-			st.f01_ctrl = e.ctrl_base;
+-			st.f01_data = e.data_base;
+-			have_f01 = true;
+-		} else if (e.fn_number == DSX_F12) {
+-			st.f12_query = e.query_base;
+-			st.f12_ctrl = e.ctrl_base;
+-			st.f12_data = e.data_base;
+-			have_f12 = true;
++		if (have_f01 && have_f12) {
++			break;            /* page 0 is all we need */
+ 		}
+ 	}
+-	st.intr_regs = (intr_count + 7u) / 8u;
++
++	st.intr_regs = (intr_total + 7u) / 8u;
+ 	if (!st.intr_regs) {
+ 		st.intr_regs = 1;
+ 	}
+-	if (!have_f01 || !have_f12) {
+-		printf("SAGIT TOUCH: PDT incomplete (f01=%d f12=%d intr_regs=%u)\n",
+-		    have_f01, have_f12, st.intr_regs);
++	if (st.intr_regs > DSX_MAX_INTR_REGS) {
++		st.intr_regs = DSX_MAX_INTR_REGS;
++	}
++	printf("SAGIT TOUCH: pdt done f01=%d f12=%d f11=%d f1a=%d intr_src=%u "
++	    "intr_regs=%u\n", have_f01, have_f12, saw_f11, saw_f1a, intr_total,
++	    st.intr_regs);
++
++	if (!have_f01) {
++		printf("SAGIT TOUCH: PDT has no F01\n");
++		return false;
++	}
++	if (!have_f12) {
++		printf("SAGIT TOUCH: PDT has no F12%s\n",
++		    saw_f11 ? " (F11 present, not supported here)" : "");
++		return false;
++	}
++
++	st.f01_query = f01.query_base;
++	st.f01_cmd = f01.cmd_base;
++	st.f01_ctrl = f01.ctrl_base;
++	st.f01_data = f01.data_base;
++	st.f12_query = f12.query_base;
++	st.f12_ctrl = f12.ctrl_base;
++	st.f12_data = f12.data_base;
++	return true;
++}
++
++static bool
++dsx_reset_and_probe(void)
++{
++	uint8_t query[DSX_F01_QUERY_LEN];
++	uint8_t q5[9], q8[5], c8[14], c23[2];
++	uint8_t q5_len, q8_len;
++	unsigned ctrl8_off, ctrl23_off, ctrl28_off;
++	char product[11];
++
++	memset(st.intr_mask, 0, sizeof(st.intr_mask));
++	st.intr_regs = 0;
++	st.num_fingers = 0;
++	st.data1_offset = 0;
++	st.sensor_max_x = 0;
++	st.sensor_max_y = 0;
++
++	st.page = 0xff; /* force a page-select write */
++	if (!dsx_scan_pdt()) {
+ 		return false;
+ 	}
+ 
+ 	if (dsx_read((uint16_t)st.f01_query, query, sizeof(query))) {
+ 		return false;
+ 	}
+-	{
+-		char product[11];
++	for (unsigned i = 0; i < 10; ++i) {
++		uint8_t c = query[11 + i];
+ 
+-		for (unsigned i = 0; i < 10; ++i) {
+-			uint8_t c = query[11 + i];
+-			product[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+-		}
+-		product[10] = 0;
+-		printf("SAGIT TOUCH: f01 manufacturer=%u product='%s' "
+-		    "build=%02x%02x%02x intr_regs=%u\n", query[0], product,
+-		    query[18], query[19], query[20], st.intr_regs);
++		product[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
++	}
++	product[10] = 0;
++	printf("SAGIT TOUCH: f01 manufacturer=%u product='%s' build=%02x%02x%02x "
++	    "intr_regs=%u\n", query[0], product, query[18], query[19],
++	    query[20], st.intr_regs);
++	touch_memdump("f01 query", (uint16_t)st.f01_query, query,
++	    sizeof(query));
++	if (query[0] != 1) {
++		printf("SAGIT TOUCH: f01 manufacturer != 1, not a Synaptics RMI4 "
++		    "device at 0x%x\n", DSX_I2C_ADDR);
+ 	}
+ 
+-	/* F12: how many control registers precede ctrl 8 / ctrl 23. */
++	/*
++	 * F12 control-register offsets, computed from the query-5 presence
++	 * map exactly as synaptics_rmi4_f12_init() does: query[4] is the
++	 * length of the map, query[5..] the "ctrl N is present" bits.
++	 */
++	if (dsx_read((uint16_t)(st.f12_query + 4), &q5_len, 1)) {
++		return false;
++	}
++	if (!q5_len || q5_len > sizeof(q5)) {
++		q5_len = sizeof(q5);
++	}
++	memset(q5, 0, sizeof(q5));
++	if (dsx_read((uint16_t)(st.f12_query + 5), q5, q5_len)) {
++		return false;
++	}
++	ctrl8_off = dsx_popcount8(q5[1]);                       /* ctrl 0..7  */
++	ctrl23_off = ctrl8_off + dsx_popcount8(q5[2]) +         /* ctrl 8..15 */
++	    dsx_popcount8((uint8_t)(q5[3] & 0x7fu));            /* ctrl 16..22 */
++	ctrl28_off = ctrl23_off +
++	    ((q5[3] >> 7) & 1u) +      /* ctrl 23 */
++	    (q5[4] & 1u) +             /* ctrl 24 */
++	    ((q5[4] >> 1) & 1u) +      /* ctrl 25 */
++	    ((q5[4] >> 2) & 1u) +      /* ctrl 26 */
++	    ((q5[4] >> 3) & 1u);       /* ctrl 27 */
++
++	memset(c23, 0, sizeof(c23));
++	if (dsx_read((uint16_t)(st.f12_ctrl + ctrl23_off), c23, sizeof(c23))) {
++		return false;
++	}
++	st.num_fingers = c23[1];       /* max reported objects */
++	if (st.num_fingers > DSX_MAX_FINGERS) {
++		st.num_fingers = DSX_MAX_FINGERS;
++	}
++	if (!st.num_fingers) {
++		st.num_fingers = 2;
++	}
++
++	if (dsx_read((uint16_t)(st.f12_query + 7), &q8_len, 1)) {
++		return false;
++	}
++	if (!q8_len || q8_len > sizeof(q8)) {
++		q8_len = sizeof(q8);
++	}
++	memset(q8, 0, sizeof(q8));
++	if (dsx_read((uint16_t)(st.f12_query + 8), q8, q8_len)) {
++		return false;
++	}
++	/* data0 present => the finger records start one register later. */
++	st.data1_offset = q8[1] & 1u;
++
++	/* Control 8: sensor maxima plus the RX/TX electrode counts. */
++	memset(c8, 0, sizeof(c8));
++	if (!dsx_read((uint16_t)(st.f12_ctrl + ctrl8_off), c8, sizeof(c8))) {
++		st.sensor_max_x = c8[0] | (c8[1] << 8);
++		st.sensor_max_y = c8[2] | (c8[3] << 8);
++	}
++	touch_memdump("f12 query5", (uint16_t)(st.f12_query + 5), q5, q5_len);
++	touch_memdump("f12 query8", (uint16_t)(st.f12_query + 8), q8, q8_len);
++	touch_memdump("f12 ctrl8", (uint16_t)(st.f12_ctrl + ctrl8_off), c8,
++	    sizeof(c8));
++	printf("SAGIT TOUCH: f12 q5len=%u ctrl8off=%u ctrl23off=%u ctrl28off=%u "
++	    "fingers=%u c23=%02x%02x data1off=%u max=%ux%u rx=%u tx=%u\n",
++	    q5_len, ctrl8_off, ctrl23_off, ctrl28_off, st.num_fingers, c23[0],
++	    c23[1], st.data1_offset, st.sensor_max_x, st.sensor_max_y, c8[12],
++	    c8[13]);
++
++	/*
++	 * Reporting enable: the same value the vendor writes to control 28,
++	 * RPT_DEFAULT | RPT_Z | RPT_WX | RPT_WY = 0x1f | 0x20 | 0xc0.
++	 */
+ 	{
+-		uint8_t q5[5], q7, q8[4], c23[2], c8[14];
+-		unsigned ctrl8_off = 0, ctrl23_off = 0;
+-		unsigned q8_len;
++		uint8_t en = DSX_F12_REPORT_ENABLE;
++		uint8_t old = 0;
+ 
+-		if (dsx_read((uint16_t)(st.f12_query + 5), q5, sizeof(q5))) {
+-			return false;
+-		}
+-		ctrl8_off = (q5[1] & 1u) + ((q5[1] >> 1) & 1u) + ((q5[1] >> 2) & 1u) +
+-		    ((q5[1] >> 3) & 1u) + ((q5[1] >> 4) & 1u) + ((q5[1] >> 5) & 1u) +
+-		    ((q5[1] >> 6) & 1u) + ((q5[1] >> 7) & 1u);
+-		ctrl23_off = ctrl8_off +
+-		    (q5[2] & 1u) + ((q5[2] >> 1) & 1u) + ((q5[2] >> 2) & 1u) +
+-		    ((q5[2] >> 3) & 1u) + ((q5[2] >> 4) & 1u) + ((q5[2] >> 5) & 1u) +
+-		    ((q5[2] >> 6) & 1u) + ((q5[2] >> 7) & 1u) +
+-		    (q5[3] & 1u) + ((q5[3] >> 1) & 1u) + ((q5[3] >> 2) & 1u) +
+-		    ((q5[3] >> 3) & 1u) + ((q5[3] >> 4) & 1u) + ((q5[3] >> 5) & 1u) +
+-		    ((q5[3] >> 6) & 1u);
+-
+-		if (dsx_read((uint16_t)(st.f12_ctrl + ctrl23_off), c23, sizeof(c23))) {
+-			return false;
+-		}
+-		st.num_fingers = c23[1];
+-		if (st.num_fingers > DSX_MAX_FINGERS) {
+-			st.num_fingers = DSX_MAX_FINGERS;
+-		}
+-		if (!st.num_fingers) {
+-			st.num_fingers = 2;
++		(void)dsx_read((uint16_t)(st.f12_ctrl + ctrl28_off), &old, 1);
++		if (dsx_write((uint16_t)(st.f12_ctrl + ctrl28_off), &en, 1)) {
++			printf("SAGIT TOUCH: f12 report enable write failed\n");
+ 		}
+-		if (dsx_read((uint16_t)(st.f12_query + 7), &q7, 1)) {
+-			return false;
+-		}
+-		q8_len = q7;
+-		if (!q8_len || q8_len > sizeof(q8)) {
+-			q8_len = sizeof(q8);
+-		}
+-		if (dsx_read((uint16_t)(st.f12_query + 8), q8, q8_len)) {
+-			return false;
+-		}
+-		/* data0 present => the finger block starts one register later. */
+-		st.data1_offset = q8[1] & 1u;
+-		/* ctrl 8 holds the sensor maxima and the RX/TX counts. */
+-		if (!dsx_read((uint16_t)(st.f12_ctrl + ctrl8_off), c8, sizeof(c8))) {
+-			st.sensor_max_x = c8[0] | (c8[1] << 8);
+-			st.sensor_max_y = c8[2] | (c8[3] << 8);
+-		}
+-		printf("SAGIT TOUCH: f12 ctrl8off=%u ctrl23off=%u fingers=%u "
+-		    "data1off=%u q8=%02x%02x%02x max=%ux%u\n", ctrl8_off,
+-		    ctrl23_off, st.num_fingers, st.data1_offset, q8[0], q8[1],
+-		    q8[2], st.sensor_max_x, st.sensor_max_y);
++		printf("SAGIT TOUCH: f12 report enable ctrl+%u %#x -> %#x\n",
++		    ctrl28_off, old, en);
+ 	}
+ 
+ 	/* F01 device status: 0x06 means the sensor is still checking its CRC. */
+@@ -1079,15 +1259,61 @@ dsx_reset_and_probe(void)
+ 			}
+ 			printf("SAGIT TOUCH: f01 ctrl=%#x\n", ctrl);
+ 		}
+-		/* Reading the interrupt status clears whatever ABL left latched. */
+-		{
+-			uint8_t intr[8] = { 0 };
+-
+-			if (st.intr_regs <= sizeof(intr)) {
+-				(void)dsx_read((uint16_t)(st.f01_data + 1), intr,
+-				    st.intr_regs);
+-				st.last_intr = intr[0];
+-			}
++	}
++
++	/* Enable the interrupt sources we understand: F01 ctrl + 1 + reg. */
++	for (unsigned i = 0; i < st.intr_regs; ++i) {
++		uint8_t want = st.intr_mask[i];
++
++		if (!want) {
++			continue;
++		}
++		if (!dsx_write((uint16_t)(st.f01_ctrl + DSX_F01_INTR_OFF + i),
++			    &want, 1)) {
++			uint8_t got = 0;
++
++			(void)dsx_read((uint16_t)(st.f01_ctrl +
++			    DSX_F01_INTR_OFF + i), &got, 1);
++			printf("SAGIT TOUCH: f01 intr en[%u] %#x -> %#x\n", i,
++			    want, got);
++		}
++	}
++
++	/* Reading the F01 interrupt status registers is what clears ATTN. */
++	{
++		uint8_t intr[DSX_MAX_INTR_REGS] = { 0 };
++
++		if (!dsx_read((uint16_t)(st.f01_data + DSX_F01_INTR_OFF), intr,
++			    st.intr_regs)) {
++			st.last_intr = intr[0];
++			printf("SAGIT TOUCH: f01 intr=%#x (cleared)\n", intr[0]);
++		}
++	}
++
++	/*
++	 * Sanity check on the map we just learned: the finger records must not
++	 * run into F01's control block.  If they do, the raw dumps above are
++	 * what says whether the PDT read or the firmware map is at fault.
++	 */
++	if (st.f01_ctrl > st.f12_data &&
++	    st.f01_ctrl < st.f12_data + st.data1_offset +
++	    st.num_fingers * DSX_F12_FINGER_SIZE) {
++		printf("SAGIT TOUCH: warning: f12 data %#x+%u overlaps f01 ctrl "
++		    "%#x; record reads may be wrong\n",
++		    st.f12_data + st.data1_offset,
++		    st.num_fingers * DSX_F12_FINGER_SIZE, st.f01_ctrl);
++	}
++
++	/*
++	 * One-time page-0 register map dump (0x00..0x5f).  This is what shows
++	 * where F01/F12 actually keep their data/control blocks and whether
++	 * the bases the PDT gave us line up, so it is printed unconditionally.
++	 */
++	{
++		uint8_t regs[0x60];
++
++		if (!dsx_read(0x0000, regs, sizeof(regs))) {
++			touch_memdump("regs", 0x0000, regs, sizeof(regs));
+ 		}
+ 	}
+ 
+@@ -1141,6 +1367,21 @@ dsx_read_report(void)
+ 	if (dsx_read((uint16_t)(st.f12_data + st.data1_offset), buf, nbytes)) {
+ 		return EIO;
+ 	}
++	/*
++	 * First time the F01 interrupt status is non-zero, dump the block we
++	 * believe is the F12 object data.  If the PDT's data base is right
++	 * this shows status bytes; if it is all zeroes while ATTN is
++	 * asserted, the "regs" dump from probe is what finds the real base.
++	 */
++	if (st.last_intr && !st.intr_dumped) {
++		st.intr_dumped = true;
++		touch_memdump("f12 data",
++		    (uint16_t)(st.f12_data + st.data1_offset), buf,
++		    nbytes < 32 ? nbytes : 32);
++		printf("SAGIT TOUCH: first ATTN: f01 intr=%#x, f12 block at %#x "
++		    "(%u bytes) above\n", st.last_intr,
++		    st.f12_data + st.data1_offset, nbytes);
++	}
+ 	if (st.debug >= 2 && st.logged_raw < 8) {
+ 		st.logged_raw++;
+ 		touch_memdump("report", (uint16_t)(st.f12_data + st.data1_offset),
+@@ -1150,7 +1391,8 @@ dsx_read_report(void)
+ 		const uint8_t *p = buf + f * (unsigned)st.finger_size;
+ 		unsigned status = p[0];
+ 
+-		if (status != 0x01u) { /* F12_FINGER_STATUS only */
++		/* F12_FINGER_STATUS (0x01) and F12_GLOVED_FINGER_STATUS (0x06) */
++		if (status != 0x01u && status != 0x06u) {
+ 			continue;
+ 		}
+ 		unsigned px = p[1] | (p[2] << 8);
+@@ -1174,8 +1416,26 @@ dsx_read_report(void)
+ 		x[f] = (int)px;
+ 		y[f] = (int)py;
+ 	}
++	if (!mask && st.intr_mask[0] && (st.last_intr & st.intr_mask[0])) {
++		if (++st.intr_no_data == 50) {
++			printf("SAGIT TOUCH: F01 intr=%#x but no finger in the F12 "
++			    "block at %#x; data base may be wrong (see regs)\n",
++			    st.last_intr, st.f12_data + st.data1_offset);
++		}
++	} else if (mask) {
++		st.intr_no_data = 0;
++	}
+ 	if (mask) {
+ 		st.reports++;
++		if (!st.report_logged) {
++			st.report_logged = true;
++			touch_memdump("report",
++			    (uint16_t)(st.f12_data + st.data1_offset), buf,
++			    nbytes < 32 ? nbytes : 32);
++			printf("SAGIT TOUCH: first report x=%d y=%d fingers=%u "
++			    "intr=%#x\n", x[0], y[0], st.num_fingers,
++			    st.last_intr);
++		}
+ 	}
+ 	touch_report(mask, x, y);
+ 	return 0;
