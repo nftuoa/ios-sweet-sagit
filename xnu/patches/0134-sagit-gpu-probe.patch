@@ -1,0 +1,940 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 24c552d..bb9ca65 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_touch_sagit.c		standard
+ bsd/dev/sweet_powerkey.c		standard
++bsd/dev/sweet_gpuprobe.c		standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_gpuprobe.c b/bsd/dev/sweet_gpuprobe.c
+new file mode 100644
+index 0000000..bd67aa6
+--- /dev/null
++++ b/bsd/dev/sweet_gpuprobe.c
+@@ -0,0 +1,901 @@
++/*
++ * SAGIT (Xiaomi Mi 6, MSM8998) Adreno 540 liveness and secure-mode probe.
++ *
++ * The port runs the whole UI on the CPU (SweetFramebuffer), and CoreAnimation
++ * keeps asking for IOAcceleratorES.  Before writing a single line of ring /
++ * firmware code we need four answers from the hardware, all of which a single
++ * boot can give us:
++ *
++ *   1. Does the GPU block answer at all?  (RBBM_HW_VERSION / RBBM_HW_RELEASE)
++ *   2. Does the vendor's own power sequence bring it up on this port --
++ *      gdsc_gpu_cx, the GX root clock, gdsc_gpu_gx -- with no RPM, no GPMU,
++ *      no clock driver?
++ *   3. Is RBBM_SECVID_TRUST_CNTL writable?  If yes, we can leave secure mode
++ *      the way mainline does when it has no zap shader.  If no, the zap
++ *      shader / TZ-PIL sub-project is mandatory and stage 2 is blocked.
++ *   4. What SMMU revision and geometry sits in front of the GPU?
++ *
++ * Everything here is read/print plus the minimum writes needed to power the
++ * block: clock branch enables, the two GDSCs, the GX root clock, and the one
++ * decisive SECVID write.  No CP, no ringbuffer, no microcode, no interrupts,
++ * nothing that can submit work.  Off unless sweetgpuprobe=1.
++ *
++ * Facts and where they were read (no offset below is guessed):
++ *
++ *  - kgsl-3d0: stock-sagit.dtb /soc/qcom,kgsl-3d0@5000000 --
++ *      reg = <0x5000000 0x40000> "kgsl_3d0_reg_memory",
++ *      qcom,chipid = <0x5040001>, qcom,highest-bank-bit = <0x0f>,
++ *      qcom,zap-shader = "a540_zap", qcom,gpmu-firmware = "a540_gpmu.fw2".
++ *      The CPU-visible register window is therefore 0x5000000..0x503ffff.
++ *
++ *  - gdsc_gpu_cx: /soc/qcom,gdsc@5066004, reg-names "base" "hw_ctrl_addr",
++ *      reg = <0x5066004 4>, <0x5066008 4>; qcom,gds-timeout = <0x1f4> (500),
++ *      qcom,no-status-check-on-disable (irrelevant for enable).
++ *    gdsc_gpu_gx: /soc/qcom,gdsc@5066094, reg-names "base" "domain_addr"
++ *      "sw_reset", reg = <0x5066094 4>, <0x5065130 4>, <0x5066090 4>;
++ *      qcom,retain-periph, qcom,reset-aon-logic, qcom,force-enable-root-clk,
++ *      clock-names = "core_root_clk", clocks = <&gfxcc 0x917f76ef>.
++ *      No qcom,gds-timeout on GX, so the driver default (100 us) applies.
++ *
++ *  - GDSCR bit layout: sagit-o-oss drivers/clk/qcom/gdsc-regulator.c --
++ *      PWR_ON_MASK BIT(31), CLK_DIS_WAIT_MASK 0xF<<12, SW_OVERRIDE_MASK
++ *      BIT(2), HW_CONTROL_MASK BIT(1), SW_COLLAPSE_MASK BIT(0);
++ *      domain-addr GMEM_CLAMP_IO_MASK BIT(0), GMEM_RESET_MASK BIT(4);
++ *      sw-reset BCR_BLK_ARES_BIT BIT(0); REG_OFFSET 0x0 in every regmap.
++ *      gdsc_probe() clears HW_CONTROL|SW_OVERRIDE and (only if the DT has
++ *      qcom,clk-dis-wait-val, which neither node has) programs CLK_DIS_WAIT.
++ *      gdsc_enable() then, in this order: root clock on, sw_reset pulse
++ *      (assert 1 us, deassert), domain GMEM_RESET pulse (assert 1 us,
++ *      deassert), clear GMEM_CLAMP_IO, clear SW_COLLAPSE, wmb, udelay(1),
++ *      poll PWR_ON in the gds_hw_ctrl register if there is one, else in
++ *      GDSCR, gds_timeout times with udelay(1) between reads, and for the
++ *      hw_ctrl case one extra full poll after printing the state.
++ *
++ *  - GPUCC block: /soc/qcom,gpucc@5065000, compatible "qcom,gpucc-8998-v2",
++ *      reg = <0x5065000 0x9000>.  Register offsets from sagit-o-oss
++ *      include/dt-bindings/clock/msm-clocks-hwio-8998.h:
++ *        GPUCC_GPU_PLL0_PLL_MODE      0x0000
++ *        GPUCC_GPU_PLL0_USER_CTL_MODE 0x000c
++ *        GPUCC_GX_DOMAIN_MISC         0x0130   -> 0x5065130 (GX domain)
++ *        GPUCC_GFX3D_CMD_RCGR         0x1070
++ *        GPUCC_GFX3D_CBCR             0x1098
++ *        GPUCC_RBBMTIMER_CMD_RCGR     0x10b0
++ *        GPUCC_RBBMTIMER_CBCR         0x10d0
++ *        GPUCC_CXO_CBCR               0x1020
++ *        GPUCC_GFX3D_ISENSE_CMD_RCGR  0x1100
++ *        GPUCC_GFX3D_ISENSE_CBCR      0x1124
++ *        GPUCC_RBCPR_CMD_RCGR         0x1030
++ *        GPUCC_RBCPR_CBCR             0x1054
++ *      and drivers/clk/msm/clock-gpu-8998.c adds the two GDSC offsets it
++ *      uses itself: GPU_CX_GDSCR_OFFSET 0x1004, GPU_GX_GDSCR_OFFSET 0x1094
++ *      (0x5066004 / 0x5066094, i.e. the same registers as the gdsc nodes).
++ *
++ *  - Core root clock: msm-clocks-8998.h:484 `#define clk_gfx3d_clk_src
++ *      0x917f76ef`, which is exactly the gdsc_gpu_gx clock specifier, so
++ *      "core_root_clk" is the gfx3d RCG at GPUCC+0x1070.  RCG layout and
++ *      bits from sagit-o-oss drivers/clk/msm/clock-local2.c:
++ *      CFG_RCGR = cmd+0x4, M = +0x8, N = +0xc, D = +0x10;
++ *      CMD_RCGR_CONFIG_UPDATE_BIT BIT(0) (self-clearing),
++ *      CMD_RCGR_ROOT_ENABLE_BIT BIT(1), CMD_RCGR_ROOT_STATUS_BIT BIT(31)
++ *      (1 = root off), CFG_RCGR_DIV_MASK 0x1f [4:0],
++ *      CFG_RCGR_SRC_SEL_MASK 0x700 [10:8]; gfx3d_clk_src has
++ *      .force_enable_rcgr = true, so clk_prepare_enable() on it is exactly
++ *      "set ROOT_EN, poll ROOT_STATUS clear" (rcg_set_force_enable()).
++ *      Divider encoding: F(f, s, div, ...) -> BVAL(4,0, 2*div-1), so the
++ *      field value 1 means /1; source select 0 = CXO, 1 = gpu_pll0 even.
++ *
++ *  - Branch CBCR bits from the same clock-local2.c: enable BIT(0), halt
++ *      status bits[31:28] = 0x0 or 0x2 means running, 0x8 means halted.
++ *      gpucc_cxo_clk is kept enabled unconditionally by the vendor GPUCC
++ *      probe ("gpucc_cxo_clk works as the root clock for all GPUCC RCGs
++ *      and GDSCs"), clock-gpu-8998.c.
++ *
++ *  - gcc_gpu_cfg_ahb_clk / gcc_gpu_bimc_gfx_clk: clock-gcc-8998.c (the GCC
++ *      probe enables gpu_cfg_ahb unconditionally at line 2772), CBCRs from
++ *      msm-clocks-hwio-8998.h: GCC_GPU_CFG_AHB_CBCR 0x71004,
++ *      GCC_GPU_BIMC_GFX_CBCR 0x71010, GCC_GPU_MISC 0x71028,
++ *      GCC_GPU_IREF_EN 0x88010.  GCC base 0x100000, size 0xb0000 (the DT's
++ *      qcom,gcc@100000 reg), the same mapping sweet_touch_sagit.c uses.
++ *
++ *  - RBBM: RBBM_HW_VERSION at dword 0x0000 and RBBM_HW_RELEASE at dword
++ *      0x0001 (mainline registers/adreno/a3xx.xml:560-561 and a4xx.xml:1127;
++ *      a5xx.xml starts the RBBM block at 0x0004 with RBBM_CFG_DBGBUS_SEL_A,
++ *      so 0x0/0x1 are the two ID dwords there too).  XML and vendor kgsl
++ *      offsets are dword indices -- adreno.c:2358 does
++ *      `base + (offsetwords << 2)` -- so the byte offsets are 0x000 and
++ *      0x004.  A5XX_RBBM_SECVID_TRUST_CNTL = 0xF400 dwords (a5xx_reg.h:531)
++ *      = 0x3d000; A5XX_RBBM_SECVID_TSB_CNTL = 0xF803 = 0x3e00c;
++ *      A5XX_RBBM_SECVID_TRUST_CONFIG = 0xF000 = 0x3c000; the TSB trusted
++ *      base/size pair at 0xF800..0xF802 = 0x3e000..0x3e008 and
++ *      A5XX_RBBM_SECVID_TSB_ADDR_MODE_CNTL = 0xF810 = 0x3e040.
++ *
++ *  - SMMU: /soc/arm,smmu-kgsl@5040000, compatible "qcom,smmu-v2",
++ *      reg = <0x5040000 0x10000>, qcom,skip-init, qcom-tz-device-id = "GPU",
++ *      vdd-supply = <gdsc_gpu_cx>.  Global register offsets from
++ *      sagit-o-oss drivers/iommu/arm-smmu.c: sCR0 0x000, ID0..ID7
++ *      0x020..0x03c (ID1 0x024, ID2 0x028, ID5 0x034), sGFSR 0x048.
++ *      Because the SMMU's supply is gdsc_gpu_cx, it is read only after CX.
++ *
++ * Design:
++ *  - one kernel thread, waits sweetgpuprobedelay seconds (default 10) so the
++ *    console ring and the log flusher are up, probes once, exits;
++ *  - every register write is logged with the value it replaced and its
++ *    read-back, every poll with its result or timeout, so one boot log tells
++ *    us which step failed;
++ *  - non-fatal: any failure prints one line and stops at that phase; the
++ *    boot continues with the CPU-rendered UI untouched;
++ *  - boot args (default off; a plain boot is unchanged):
++ *      sweetgpuprobe=1          run the probe
++ *      sweetgpuprobedelay=<s>   seconds to wait first (1..120, default 10)
++ */
++#if defined(ARM64_BOARD_CONFIG_SAGIT)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
++
++void sweet_gpuprobe_init(void);
++
++#define GP_PFX "SWEET GPU: "
++
++/* ------------------------------------------------------------------ */
++/* Windows (stock device tree, see the header)                         */
++/* ------------------------------------------------------------------ */
++#define GP_GPUCC_PA   0x05065000u	/* qcom,gpucc@5065000   */
++#define GP_GPUCC_SZ   0x00009000u	/* reg = <0x5065000 0x9000> */
++#define GP_KGSL_PA    0x05000000u	/* qcom,kgsl-3d0@5000000 */
++#define GP_KGSL_SZ    0x00040000u	/* reg = <0x5000000 0x40000> */
++#define GP_SMMU_PA    0x05040000u	/* arm,smmu-kgsl@5040000 */
++#define GP_SMMU_SZ    0x00010000u	/* reg = <0x5040000 0x10000> */
++#define GP_GCC_PA     0x00100000u	/* qcom,gcc@100000 */
++#define GP_GCC_SZ     0x000b0000u	/* reg = <0x100000 0xb0000> */
++
++/* GPUCC offsets, msm-clocks-hwio-8998.h / clock-gpu-8998.c */
++#define GP_GPUCC_PLL0_MODE      0x0000u
++#define GP_GPUCC_PLL0_USER      0x000cu
++#define GP_GPUCC_GX_DOMAIN      0x0130u	/* GPUCC_GX_DOMAIN_MISC  */
++#define GP_GPUCC_CXO_CBCR       0x1020u
++#define GP_GPUCC_CX_GDSCR       0x1004u	/* GPU_CX_GDSCR_OFFSET   */
++#define GP_GPUCC_CX_GDS_HW_CTRL 0x1008u	/* reg-names "hw_ctrl_addr" */
++#define GP_GPUCC_RBCPR_RCGR     0x1030u
++#define GP_GPUCC_RBCPR_CBCR     0x1054u
++#define GP_GPUCC_GFX3D_RCGR     0x1070u	/* GPUCC_GFX3D_CMD_RCGR  */
++#define GP_GPUCC_GFX3D_CFG      0x1074u	/* CFG_RCGR_REG = cmd+4  */
++#define GP_GPUCC_GFX3D_CBCR     0x1098u
++#define GP_GPUCC_GX_BCR         0x1090u	/* gdsc_gpu_gx "sw_reset" */
++#define GP_GPUCC_GX_GDSCR       0x1094u	/* GPU_GX_GDSCR_OFFSET   */
++#define GP_GPUCC_RBBMTIMER_RCGR 0x10b0u
++#define GP_GPUCC_RBBMTIMER_CBCR 0x10d0u
++#define GP_GPUCC_ISENSE_RCGR    0x1100u
++#define GP_GPUCC_ISENSE_CBCR    0x1124u
++
++/* GDSCR bits, gdsc-regulator.c */
++#define GP_GDSCR_PWR_ON     (1u << 31)
++#define GP_GDSCR_HW_CTRL    (1u << 1)
++#define GP_GDSCR_SW_OVERRIDE (1u << 2)
++#define GP_GDSCR_SW_COLLAPSE (1u << 0)
++/* GX domain (GPUCC_GX_DOMAIN_MISC) bits, gdsc-regulator.c */
++#define GP_DOMAIN_CLAMP_IO  (1u << 0)
++#define GP_DOMAIN_GMEM_RESET (1u << 4)
++/* GX sw_reset bit, gdsc-regulator.c (BCR_BLK_ARES_BIT) */
++#define GP_GX_BLK_ARES      (1u << 0)
++
++/* RCG bits, clock-local2.c */
++#define GP_RCG_UPDATE     (1u << 0)
++#define GP_RCG_ROOT_EN    (1u << 1)
++#define GP_RCG_ROOT_OFF   (1u << 31)
++#define GP_RCG_DIV_MASK   0x1fu		/* CFG_RCGR_DIV_MASK      */
++#define GP_RCG_SRC_MASK   0x700u	/* CFG_RCGR_SRC_SEL_MASK  */
++#define GP_RCG_SRC_CXO    0u
++#define GP_RCG_DIV_1      1u		/* F(div=1) -> 2*1-1 = 1  */
++
++/* CBCR bits, clock-local2.c */
++#define GP_CBCR_ENABLE    (1u << 0)
++#define GP_CBCR_HALT_MASK 0xf0000000u
++#define GP_CBCR_HALT_ON   0x00000000u
++#define GP_CBCR_HALT_NOC  0x20000000u
++#define GP_CBCR_HALT_OFF  0x80000000u
++
++/* GCC GPU clocks, msm-clocks-hwio-8998.h */
++#define GP_GCC_GPU_CFG_AHB_CBCR  0x71004u
++#define GP_GCC_GPU_BIMC_GFX_CBCR 0x71010u
++#define GP_GCC_GPU_MISC          0x71028u
++#define GP_GCC_GPU_IREF_EN       0x88010u
++
++/* RBBM / RBBM SECVID, a5xx_reg.h dword offsets -> bytes (see header) */
++#define GP_RBBM_HW_VERSION        0x00000u
++#define GP_RBBM_HW_RELEASE        0x00004u
++#define GP_RBBM_SECVID_TRUST_CFG  0x3c000u	/* 0xF000 << 2 */
++#define GP_RBBM_SECVID_TRUST_CNTL 0x3d000u	/* 0xF400 << 2 */
++#define GP_RBBM_SECVID_TSB_BASE_LO 0x3e000u	/* 0xF800 << 2 */
++#define GP_RBBM_SECVID_TSB_BASE_HI 0x3e004u	/* 0xF801 << 2 */
++#define GP_RBBM_SECVID_TSB_SIZE    0x3e008u	/* 0xF802 << 2 */
++#define GP_RBBM_SECVID_TSB_CNTL    0x3e00cu	/* 0xF803 << 2 */
++#define GP_RBBM_SECVID_TSB_ADDR_MODE 0x3e040u	/* 0xF810 << 2 */
++
++/* SMMU global registers, drivers/iommu/arm-smmu.c */
++#define GP_SMMU_sCR0  0x000u
++#define GP_SMMU_ID0   0x020u
++#define GP_SMMU_ID1   0x024u
++#define GP_SMMU_ID2   0x028u
++#define GP_SMMU_ID5   0x034u
++#define GP_SMMU_sGFSR 0x048u
++
++/* Poll budgets: the DT's qcom,gds-timeout (500 us) and the driver's
++ * TIMEOUT_US default (100 us); RCG/CBCR polls use the clock driver's
++ * UPDATE_CHECK_MAX_LOOPS (500). */
++#define GP_CX_TIMEOUT  500u
++#define GP_GX_TIMEOUT  100u
++#define GP_CLK_TIMEOUT 500u
++
++static struct {
++	vm_offset_t gpucc;
++	vm_offset_t kgsl;
++	vm_offset_t smmu;
++	vm_offset_t gcc;
++	unsigned delay_s;
++	bool cx_ok;
++	bool gx_ok;
++	bool root_ok;
++	bool core_clk_ok;
++	bool ahb_ok;
++	bool alive;
++	bool secvid_ok;
++} gp;
++
++static int gp_started;
++static int gp_sleep_chan;
++
++/* ------------------------------------------------------------------ */
++/* MMIO helpers: every write is logged with "was" and read-back.       */
++/* ------------------------------------------------------------------ */
++static uint32_t
++gp_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++gp_wr_raw(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dsb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static uint32_t
++gp_wr(const char *what, vm_offset_t base, uint32_t off, uint32_t val)
++{
++	uint32_t was = gp_rd(base, off);
++	uint32_t rb;
++
++	gp_wr_raw(base, off, val);
++	rb = gp_rd(base, off);
++	printf(GP_PFX "W %s = 0x%08x (was 0x%08x) rb 0x%08x\n", what, val, was, rb);
++	return rb;
++}
++
++/*
++ * Poll `mask` in a register for `want`, `tries` microseconds.  Returns 0 on
++ * success and -1 on timeout; either way one log line records the outcome.
++ */
++static int
++gp_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want,
++    unsigned tries, const char *what)
++{
++	uint32_t v = gp_rd(base, off);
++
++	for (unsigned i = 0; i < tries; ++i) {
++		if ((v & mask) == want) {
++			printf(GP_PFX "poll %s: ok after %u us, 0x%08x\n",
++			    what, i, v);
++			return 0;
++		}
++		delay(1);
++		v = gp_rd(base, off);
++	}
++	printf(GP_PFX "poll %s: TIMEOUT after %u us, 0x%08x "
++	    "(mask 0x%08x, wanted 0x%08x)\n", what, tries, v, mask, want);
++	return -1;
++}
++
++static bool
++gp_branch_running(uint32_t cbcr)
++{
++	uint32_t halt = cbcr & GP_CBCR_HALT_MASK;
++
++	return halt == GP_CBCR_HALT_ON || halt == GP_CBCR_HALT_NOC;
++}
++
++/*
++ * Enable one CBCR branch and wait for the halt nibble to go away.  Returns
++ * true when the branch reads back running (ABL may already have left it on,
++ * in which case nothing is written).
++ */
++static bool
++gp_branch_on(vm_offset_t base, uint32_t off, const char *what)
++{
++	uint32_t v = gp_rd(base, off);
++
++	if (gp_branch_running(v)) {
++		printf(GP_PFX "%s already running: 0x%08x\n", what, v);
++		return true;
++	}
++	printf(GP_PFX "%s halted: 0x%08x\n", what, v);
++	(void)gp_wr(what, base, off, v | GP_CBCR_ENABLE);
++	if (gp_poll(base, off, GP_CBCR_HALT_MASK, GP_CBCR_HALT_ON,
++	    GP_CLK_TIMEOUT, what) == 0) {
++		return true;
++	}
++	/* A NOC-FSM branch can report 0x2 rather than 0x0. */
++	if (gp_poll(base, off, GP_CBCR_HALT_MASK, GP_CBCR_HALT_NOC,
++	    GP_CLK_TIMEOUT, what) == 0) {
++		return true;
++	}
++	return false;
++}
++
++static void
++gp_print_gdscr(const char *name, uint32_t v)
++{
++	printf(GP_PFX "%s = 0x%08x (PWR_ON=%u HW_CTRL=%u SW_OVERRIDE=%u "
++	    "SW_COLLAPSE=%u)\n", name, v, (v & GP_GDSCR_PWR_ON) ? 1u : 0u,
++	    (v & GP_GDSCR_HW_CTRL) ? 1u : 0u,
++	    (v & GP_GDSCR_SW_OVERRIDE) ? 1u : 0u,
++	    (v & GP_GDSCR_SW_COLLAPSE) ? 1u : 0u);
++}
++
++/* ------------------------------------------------------------------ */
++/* Phase 1: read-only snapshot of every register this probe will touch */
++/* ------------------------------------------------------------------ */
++static void
++gp_snapshot(void)
++{
++	uint32_t v, cx, gx, dom, bcr, cbcr;
++
++	printf(GP_PFX "--- registers before any write ---\n");
++	printf(GP_PFX "windows: GPUCC=0x%08x+0x%x kgsl=0x%08x+0x%x "
++	    "smmu=0x%08x+0x%x gcc=0x%08x+0x%x\n",
++	    (uint32_t)GP_GPUCC_PA, (uint32_t)GP_GPUCC_SZ,
++	    (uint32_t)GP_KGSL_PA, (uint32_t)GP_KGSL_SZ,
++	    (uint32_t)GP_SMMU_PA, (uint32_t)GP_SMMU_SZ,
++	    (uint32_t)GP_GCC_PA, (uint32_t)GP_GCC_SZ);
++
++	cx = gp_rd(gp.gpucc, GP_GPUCC_CX_GDSCR);
++	gp_print_gdscr("gdsc_gpu_cx GDSCR 0x5066004", cx);
++	printf(GP_PFX "gdsc_gpu_cx GDS_HW_CTRL 0x5066008 = 0x%08x\n",
++	    gp_rd(gp.gpucc, GP_GPUCC_CX_GDS_HW_CTRL));
++
++	gx = gp_rd(gp.gpucc, GP_GPUCC_GX_GDSCR);
++	gp_print_gdscr("gdsc_gpu_gx GDSCR 0x5066094", gx);
++	dom = gp_rd(gp.gpucc, GP_GPUCC_GX_DOMAIN);
++	printf(GP_PFX "gdsc_gpu_gx domain 0x5065130 = 0x%08x "
++	    "(CLAMP_IO=%u GMEM_RESET=%u)\n", dom,
++	    (dom & GP_DOMAIN_CLAMP_IO) ? 1u : 0u,
++	    (dom & GP_DOMAIN_GMEM_RESET) ? 1u : 0u);
++	bcr = gp_rd(gp.gpucc, GP_GPUCC_GX_BCR);
++	printf(GP_PFX "gdsc_gpu_gx sw_reset 0x5066090 = 0x%08x (BLK_ARES=%u)\n",
++	    bcr, (bcr & GP_GX_BLK_ARES) ? 1u : 0u);
++
++	cbcr = gp_rd(gp.gpucc, GP_GPUCC_CXO_CBCR);
++	printf(GP_PFX "gpucc_cxo_clk CBCR 0x5066020 = 0x%08x (%s)\n", cbcr,
++	    gp_branch_running(cbcr) ? "on" : "halted");
++	cbcr = gp_rd(gp.gpucc, GP_GPUCC_GFX3D_CBCR);
++	printf(GP_PFX "gpucc_gfx3d_clk CBCR 0x5066098 = 0x%08x (%s)\n", cbcr,
++	    gp_branch_running(cbcr) ? "on" : "halted");
++
++	v = gp_rd(gp.gpucc, GP_GPUCC_GFX3D_RCGR);
++	printf(GP_PFX "gfx3d_clk_src CMD_RCGR 0x5066070 = 0x%08x "
++	    "(ROOT_EN=%u UPDATE=%u root=%s)\n", v,
++	    (v & GP_RCG_ROOT_EN) ? 1u : 0u, (v & GP_RCG_UPDATE) ? 1u : 0u,
++	    (v & GP_RCG_ROOT_OFF) ? "off" : "on");
++	v = gp_rd(gp.gpucc, GP_GPUCC_GFX3D_CFG);
++	printf(GP_PFX "gfx3d_clk_src CFG_RCGR 0x5066074 = 0x%08x "
++	    "(src_sel=%u div=%u)\n", v, (v & GP_RCG_SRC_MASK) >> 8,
++	    v & GP_RCG_DIV_MASK);
++	v = gp_rd(gp.gpucc, GP_GPUCC_PLL0_MODE);
++	printf(GP_PFX "gpu_pll0 PLL_MODE 0x5065000 = 0x%08x "
++	    "(lock=%u active=%u)\n", v, (v >> 31) & 1u, (v >> 30) & 1u);
++
++	cbcr = gp_rd(gp.gcc, GP_GCC_GPU_CFG_AHB_CBCR);
++	printf(GP_PFX "gcc_gpu_cfg_ahb_clk CBCR 0x1071004 = 0x%08x (%s)\n",
++	    cbcr, gp_branch_running(cbcr) ? "on" : "halted");
++	cbcr = gp_rd(gp.gcc, GP_GCC_GPU_BIMC_GFX_CBCR);
++	printf(GP_PFX "gcc_gpu_bimc_gfx_clk CBCR 0x1071010 = 0x%08x (%s)\n",
++	    cbcr, gp_branch_running(cbcr) ? "on" : "halted");
++	printf(GP_PFX "gcc GPU_MISC 0x1071028 = 0x%08x, GPU_IREF_EN 0x1088010 "
++	    "= 0x%08x\n", gp_rd(gp.gcc, GP_GCC_GPU_MISC),
++	    gp_rd(gp.gcc, GP_GCC_GPU_IREF_EN));
++}
++
++/* ------------------------------------------------------------------ */
++/* Phase 2: the clocks the vendor's GCC/GPUCC probes leave on         */
++/* ------------------------------------------------------------------ */
++static void
++gp_clock_cxo(void)
++{
++	/* "gpucc_cxo_clk works as the root clock for all GPUCC RCGs and
++	 * GDSCs.  Keep it enabled always." (clock-gpu-8998.c) */
++	(void)gp_branch_on(gp.gpucc, GP_GPUCC_CXO_CBCR, "gpucc_cxo_clk CBCR");
++}
++
++static void
++gp_clock_ahb(void)
++{
++	/* clock-gcc-8998.c:2772 enables this unconditionally at GCC probe
++	 * time; the GPU register window (RBBM and the SMMU) is behind it. */
++	gp.ahb_ok = gp_branch_on(gp.gcc, GP_GCC_GPU_CFG_AHB_CBCR,
++	    "gcc_gpu_cfg_ahb_clk CBCR");
++	if (!gp.ahb_ok) {
++		printf(GP_PFX "gpu_cfg_ahb_clk did not come up; RBBM/SMMU "
++		    "accesses would hang, so they are skipped\n");
++	}
++	/* mem_clk / mem_iface_clk are read for the log only: nothing this
++	 * probe does needs the BIMC path, and voting it is RPM territory. */
++	(void)gp_branch_on(gp.gcc, GP_GCC_GPU_BIMC_GFX_CBCR,
++	    "gcc_gpu_bimc_gfx_clk CBCR");
++}
++
++/* ------------------------------------------------------------------ */
++/* Phase 3: gdsc_gpu_cx then gdsc_gpu_gx, in gdsc-regulator.c order     */
++/* ------------------------------------------------------------------ */
++
++/* gdsc_probe(): clear HW_CONTROL and SW_OVERRIDE; neither node carries
++ * qcom,clk-dis-wait-val, so CLK_DIS_WAIT is left alone. */
++static void
++gp_gdsc_prep(const char *name, uint32_t gdscr_off)
++{
++	uint32_t v = gp_rd(gp.gpucc, gdscr_off);
++	uint32_t want = v & ~(GP_GDSCR_HW_CTRL | GP_GDSCR_SW_OVERRIDE);
++
++	if (v & GP_GDSCR_HW_CTRL) {
++		printf(GP_PFX "%s is under HW control (0x%08x); the vendor "
++		    "probe clears that bit before enabling\n", name, v);
++	}
++	if (want != v) {
++		(void)gp_wr(name, gp.gpucc, gdscr_off, want);
++	}
++}
++
++static int
++gp_gdsc_cx(void)
++{
++	uint32_t gdscr, hw;
++
++	gp_gdsc_prep("gdsc_gpu_cx GDSCR", GP_GPUCC_CX_GDSCR);
++
++	gdscr = gp_rd(gp.gpucc, GP_GPUCC_CX_GDSCR);
++	(void)gp_wr("gdsc_gpu_cx GDSCR (clear SW_COLLAPSE)", gp.gpucc,
++	    GP_GPUCC_CX_GDSCR, gdscr & ~GP_GDSCR_SW_COLLAPSE);
++	__asm__ volatile("dsb osh" ::: "memory");
++	delay(1);
++
++	if (gp_poll(gp.gpucc, GP_GPUCC_CX_GDS_HW_CTRL, GP_GDSCR_PWR_ON,
++	    GP_GDSCR_PWR_ON, GP_CX_TIMEOUT, "gdsc_gpu_cx PWR_ON (hw_ctrl)") == 0) {
++		return 0;
++	}
++
++	/* The vendor re-polls once for the hw_ctrl case after printing. */
++	hw = gp_rd(gp.gpucc, GP_GPUCC_CX_GDS_HW_CTRL);
++	printf(GP_PFX "gdsc_gpu_cx after %u us: GDSCR 0x%08x hw_ctrl 0x%08x; "
++	    "re-polling\n", GP_CX_TIMEOUT, gp_rd(gp.gpucc, GP_GPUCC_CX_GDSCR), hw);
++	if (gp_poll(gp.gpucc, GP_GPUCC_CX_GDS_HW_CTRL, GP_GDSCR_PWR_ON,
++	    GP_GDSCR_PWR_ON, GP_CX_TIMEOUT, "gdsc_gpu_cx PWR_ON (hw_ctrl, retry)") == 0) {
++		return 0;
++	}
++	printf(GP_PFX "gdsc_gpu_cx FAILED: GDSCR 0x%08x hw_ctrl 0x%08x\n",
++	    gp_rd(gp.gpucc, GP_GPUCC_CX_GDSCR),
++	    gp_rd(gp.gpucc, GP_GPUCC_CX_GDS_HW_CTRL));
++	return -1;
++}
++
++/*
++ * gdsc_gpu_gx's core_root_clk is clk_gfx3d_clk_src (0x917f76ef), the RCG at
++ * GPUCC+0x1070.  The gdsc driver does clk_prepare_enable() on it before the
++ * GDSCR write (qcom,force-enable-root-clk) and drops it again afterwards;
++ * this probe keeps it on because the gfx3d branch that gives us RBBM access
++ * is its child.
++ */
++static int
++gp_root_clock(void)
++{
++	uint32_t cmd, cfg, rb;
++	int ret;
++
++	cmd = gp_rd(gp.gpucc, GP_GPUCC_GFX3D_RCGR);
++	cfg = gp_rd(gp.gpucc, GP_GPUCC_GFX3D_CFG);
++	printf(GP_PFX "root clock before: CMD_RCGR 0x%08x CFG_RCGR 0x%08x "
++	    "(src_sel=%u div=%u root=%s)\n", cmd, cfg,
++	    (cfg & GP_RCG_SRC_MASK) >> 8, cfg & GP_RCG_DIV_MASK,
++	    (cmd & GP_RCG_ROOT_OFF) ? "off" : "on");
++
++	if (!(cmd & GP_RCG_ROOT_OFF)) {
++		printf(GP_PFX "root clock already running (ROOT_EN=%u)\n",
++		    (cmd & GP_RCG_ROOT_EN) ? 1u : 0u);
++		return 0;
++	}
++
++	rb = gp_wr("gfx3d_clk_src CMD_RCGR (set ROOT_EN)", gp.gpucc,
++	    GP_GPUCC_GFX3D_RCGR, cmd | GP_RCG_ROOT_EN);
++	ret = gp_poll(gp.gpucc, GP_GPUCC_GFX3D_RCGR, GP_RCG_ROOT_OFF,
++	    0, GP_CLK_TIMEOUT, "gfx3d_clk_src ROOT_OFF");
++	if (ret == 0) {
++		printf(GP_PFX "root clock after: CMD_RCGR 0x%08x\n",
++		    gp_rd(gp.gpucc, GP_GPUCC_GFX3D_RCGR));
++		return 0;
++	}
++	printf(GP_PFX "ROOT_EN did not clear ROOT_OFF (CMD_RCGR 0x%08x); "
++	    "the RCG has no usable parent config, falling back to CXO /1 "
++	    "(19.2 MHz)\n", rb);
++
++	/* F(div=1) -> DIV field 1; source select 0 = gpucc_cxo_clk.  This is
++	 * the same shape the vendor's set_rate_hid() writes. */
++	cfg = gp_rd(gp.gpucc, GP_GPUCC_GFX3D_CFG);
++	rb = gp_wr("gfx3d_clk_src CFG_RCGR (src=CXO div=1)", gp.gpucc,
++	    GP_GPUCC_GFX3D_CFG, (cfg & ~(GP_RCG_SRC_MASK | GP_RCG_DIV_MASK)) |
++	    (GP_RCG_SRC_CXO << 8) | GP_RCG_DIV_1);
++	(void)rb;
++
++	cmd = gp_rd(gp.gpucc, GP_GPUCC_GFX3D_RCGR);
++	(void)gp_wr("gfx3d_clk_src CMD_RCGR (trigger UPDATE)", gp.gpucc,
++	    GP_GPUCC_GFX3D_RCGR, cmd | GP_RCG_UPDATE);
++	if (gp_poll(gp.gpucc, GP_GPUCC_GFX3D_RCGR, GP_RCG_UPDATE, 0,
++	    GP_CLK_TIMEOUT, "gfx3d_clk_src UPDATE") != 0) {
++		printf(GP_PFX "RCG update never completed; GX cannot be "
++		    "clocked, power path is wrong\n");
++		return -1;
++	}
++
++	cmd = gp_rd(gp.gpucc, GP_GPUCC_GFX3D_RCGR);
++	(void)gp_wr("gfx3d_clk_src CMD_RCGR (set ROOT_EN)", gp.gpucc,
++	    GP_GPUCC_GFX3D_RCGR, cmd | GP_RCG_ROOT_EN);
++	if (gp_poll(gp.gpucc, GP_GPUCC_GFX3D_RCGR, GP_RCG_ROOT_OFF, 0,
++	    GP_CLK_TIMEOUT, "gfx3d_clk_src ROOT_OFF (after CXO)") != 0) {
++		printf(GP_PFX "root clock still off with CXO selected; the "
++		    "GPUCC root clock path is the problem\n");
++		return -1;
++	}
++	printf(GP_PFX "root clock after fallback: CMD_RCGR 0x%08x "
++	    "CFG_RCGR 0x%08x\n", gp_rd(gp.gpucc, GP_GPUCC_GFX3D_RCGR),
++	    gp_rd(gp.gpucc, GP_GPUCC_GFX3D_CFG));
++	return 0;
++}
++
++static int
++gp_gdsc_gx(void)
++{
++	uint32_t v, dom;
++
++	gp_gdsc_prep("gdsc_gpu_gx GDSCR", GP_GPUCC_GX_GDSCR);
++
++	/* sw_reset: assert BLK_ARES for 1 us, then deassert. */
++	v = gp_rd(gp.gpucc, GP_GPUCC_GX_BCR);
++	(void)gp_wr("gdsc_gpu_gx sw_reset (BLK_ARES=1)", gp.gpucc,
++	    GP_GPUCC_GX_BCR, v | GP_GX_BLK_ARES);
++	__asm__ volatile("dsb osh" ::: "memory");
++	delay(1);
++	(void)gp_wr("gdsc_gpu_gx sw_reset (BLK_ARES=0)", gp.gpucc,
++	    GP_GPUCC_GX_BCR, v & ~GP_GX_BLK_ARES);
++	__asm__ volatile("dsb osh" ::: "memory");
++
++	/* domain: qcom,reset-aon-logic -> pulse GMEM_RESET, then drop
++	 * CLAMP_IO. */
++	dom = gp_rd(gp.gpucc, GP_GPUCC_GX_DOMAIN);
++	(void)gp_wr("gdsc_gpu_gx domain (GMEM_RESET=1)", gp.gpucc,
++	    GP_GPUCC_GX_DOMAIN, dom | GP_DOMAIN_GMEM_RESET);
++	__asm__ volatile("dsb osh" ::: "memory");
++	delay(1);
++	(void)gp_wr("gdsc_gpu_gx domain (GMEM_RESET=0)", gp.gpucc,
++	    GP_GPUCC_GX_DOMAIN, dom & ~GP_DOMAIN_GMEM_RESET);
++	__asm__ volatile("dsb osh" ::: "memory");
++	dom = gp_rd(gp.gpucc, GP_GPUCC_GX_DOMAIN);
++	(void)gp_wr("gdsc_gpu_gx domain (CLAMP_IO=0)", gp.gpucc,
++	    GP_GPUCC_GX_DOMAIN, dom & ~GP_DOMAIN_CLAMP_IO);
++	__asm__ volatile("dsb osh" ::: "memory");
++
++	/* GDSCR: clear SW_COLLAPSE, then poll PWR_ON in GDSCR itself (no
++	 * hw_ctrl register on this node). */
++	v = gp_rd(gp.gpucc, GP_GPUCC_GX_GDSCR);
++	(void)gp_wr("gdsc_gpu_gx GDSCR (clear SW_COLLAPSE)", gp.gpucc,
++	    GP_GPUCC_GX_GDSCR, v & ~GP_GDSCR_SW_COLLAPSE);
++	__asm__ volatile("dsb osh" ::: "memory");
++	delay(1);
++
++	if (gp_poll(gp.gpucc, GP_GPUCC_GX_GDSCR, GP_GDSCR_PWR_ON,
++	    GP_GDSCR_PWR_ON, GP_GX_TIMEOUT, "gdsc_gpu_gx PWR_ON") == 0) {
++		return 0;
++	}
++	/* The vendor waits the same timeout again and prints the final
++	 * state; do the same so the log carries both samples. */
++	delay((int)GP_GX_TIMEOUT);
++	printf(GP_PFX "gdsc_gpu_gx final: GDSCR 0x%08x domain 0x%08x\n",
++	    gp_rd(gp.gpucc, GP_GPUCC_GX_GDSCR),
++	    gp_rd(gp.gpucc, GP_GPUCC_GX_DOMAIN));
++	return -1;
++}
++
++/* ------------------------------------------------------------------ */
++/* Phase 4: RBBM identity and the decisive SECVID write               */
++/* ------------------------------------------------------------------ */
++static void
++gp_rbbm(void)
++{
++	uint32_t ver, rel, before, rb, rb2, rb3;
++
++	if (!gp.cx_ok) {
++		printf(GP_PFX "RBBM not read: gdsc_gpu_cx never came up, the "
++		    "window is unclocked\n");
++		return;
++	}
++
++	ver = gp_rd(gp.kgsl, GP_RBBM_HW_VERSION);
++	rel = gp_rd(gp.kgsl, GP_RBBM_HW_RELEASE);
++	printf(GP_PFX "RBBM_HW_VERSION 0x5000000 = 0x%08x\n", ver);
++	printf(GP_PFX "RBBM_HW_RELEASE 0x5000004 = 0x%08x\n", rel);
++	printf(GP_PFX "RBBM neighbours 0x5000008 = 0x%08x 0x500000c = 0x%08x "
++	    "(DT qcom,chipid = 0x5040001)\n",
++	    gp_rd(gp.kgsl, 0x00008u), gp_rd(gp.kgsl, 0x0000cu));
++
++	if (ver == 0xffffffffu || ver == 0u) {
++		printf(GP_PFX "RBBM reads 0x%08x: the GPU block is NOT alive "
++		    "even with both GDSCs and the core clock on\n", ver);
++		gp.alive = false;
++		return;
++	}
++	gp.alive = true;
++	printf(GP_PFX "RBBM answers: block is alive\n");
++
++	/* Informational only; never written. */
++	printf(GP_PFX "RBBM_SECVID_TRUST_CONFIG 0x503c000 = 0x%08x\n",
++	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TRUST_CFG));
++	printf(GP_PFX "RBBM_SECVID_TSB_CNTL 0x503e00c = 0x%08x\n",
++	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TSB_CNTL));
++	printf(GP_PFX "RBBM_SECVID_TSB trusted base/size 0x503e000..8 = "
++	    "0x%08x 0x%08x 0x%08x, ADDR_MODE_CNTL 0x503e040 = 0x%08x\n",
++	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TSB_BASE_LO),
++	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TSB_BASE_HI),
++	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TSB_SIZE),
++	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TSB_ADDR_MODE));
++
++	before = gp_rd(gp.kgsl, GP_RBBM_SECVID_TRUST_CNTL);
++	printf(GP_PFX "RBBM_SECVID_TRUST_CNTL 0x503d000 = 0x%08x before the "
++	    "write\n", before);
++
++	/*
++	 * The decisive store.  Print the intent first: if the TZ owns this
++	 * register the access may take a bus error / SError and the line
++	 * above is the last thing in the ring.  Mainline does exactly this
++	 * when it has no zap shader (a5xx_gpu.c:1003) and warns that a
++	 * permissions violation follows if the guess was wrong.
++	 */
++	printf(GP_PFX "writing RBBM_SECVID_TRUST_CNTL = 0 (leave secure mode "
++	    "the mainline way, without a zap shader)\n");
++	gp_wr_raw(gp.kgsl, GP_RBBM_SECVID_TRUST_CNTL, 0x00000000u);
++
++	rb = gp_rd(gp.kgsl, GP_RBBM_SECVID_TRUST_CNTL);
++	delay(1);
++	rb2 = gp_rd(gp.kgsl, GP_RBBM_SECVID_TRUST_CNTL);
++	delay(1);
++	rb3 = gp_rd(gp.kgsl, GP_RBBM_SECVID_TRUST_CNTL);
++	printf(GP_PFX "RBBM_SECVID_TRUST_CNTL after the write: 0x%08x "
++	    "0x%08x 0x%08x\n", rb, rb2, rb3);
++
++	if (rb == 0 && rb2 == 0 && rb3 == 0) {
++		gp.secvid_ok = true;
++		printf(GP_PFX "SECVID write STUCK at 0: the GPU can be taken "
++		    "out of secure mode without a zap shader\n");
++	} else {
++		gp.secvid_ok = false;
++		printf(GP_PFX "SECVID write was BLOCKED (reads back 0x%08x): "
++		    "the TZ/hypervisor owns secure mode, the zap shader / SMC "
++		    "path is mandatory\n", rb);
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* Phase 5: SMMU identity (only after CX, since its supply is CX)     */
++/* ------------------------------------------------------------------ */
++static void
++gp_smmu(void)
++{
++	uint32_t scr0, id0, id1, id2, id5, gfsr;
++
++	if (!gp.cx_ok || !gp.ahb_ok) {
++		printf(GP_PFX "SMMU not read: %s\n", !gp.cx_ok ?
++		    "gdsc_gpu_cx is off" : "gpu_cfg_ahb_clk is off");
++		return;
++	}
++
++	scr0 = gp_rd(gp.smmu, GP_SMMU_sCR0);
++	id0 = gp_rd(gp.smmu, GP_SMMU_ID0);
++	id1 = gp_rd(gp.smmu, GP_SMMU_ID1);
++	id2 = gp_rd(gp.smmu, GP_SMMU_ID2);
++	id5 = gp_rd(gp.smmu, GP_SMMU_ID5);
++	gfsr = gp_rd(gp.smmu, GP_SMMU_sGFSR);
++
++	printf(GP_PFX "SMMU_sCR0 0x5040000 = 0x%08x (CLIENTPD=%u GFRE=%u "
++	    "GFIE=%u USFCFG=%u VMIDPNE=%u BSU=%u)\n", scr0,
++	    scr0 & 1u, (scr0 >> 1) & 1u, (scr0 >> 2) & 1u,
++	    (scr0 >> 10) & 1u, (scr0 >> 11) & 1u, (scr0 >> 14) & 3u);
++	printf(GP_PFX "SMMU_IDR0 0x5040020 = 0x%08x (S1TS=%u S2TS=%u NTS=%u "
++	    "SMS=%u NUMIRPT=%u NUMSIDB=%u NUMSMRG=%u)\n", id0,
++	    (id0 >> 30) & 1u, (id0 >> 29) & 1u, (id0 >> 28) & 1u,
++	    (id0 >> 27) & 1u, (id0 >> 16) & 0xffu, (id0 >> 9) & 0xfu,
++	    id0 & 0xffu);
++	printf(GP_PFX "SMMU_IDR1 0x5040024 = 0x%08x (PAGESIZE=%u "
++	    "NUMPAGENDXB=%u NUMS2CB=%u NUMCB=%u, cb shift=%u)\n", id1,
++	    (id1 >> 31) & 1u, (id1 >> 28) & 7u, (id1 >> 16) & 0xffu,
++	    id1 & 0xffu, 12u + ((id1 >> 28) & 7u));
++	printf(GP_PFX "SMMU_IDR2 0x5040028 = 0x%08x (IAS=2^%u OAS=2^%u "
++	    "UBS=2^%u PTFS_4K=%u PTFS_16K=%u PTFS_64K=%u)\n", id2,
++	    (id2 & 0xfu) + 1u, ((id2 >> 4) & 0xfu) + 1u,
++	    ((id2 >> 8) & 0xfu) + 1u, (id2 >> 12) & 1u, (id2 >> 13) & 1u,
++	    (id2 >> 14) & 1u);
++	printf(GP_PFX "SMMU_IDR5 0x5040034 = 0x%08x\n", id5);
++	printf(GP_PFX "SMMU_sGFSR 0x5040048 = 0x%08x (read only)\n", gfsr);
++}
++
++/* ------------------------------------------------------------------ */
++/* One-line verdict for the decision table in the doc                  */
++/* ------------------------------------------------------------------ */
++static void
++gp_verdict(void)
++{
++	if (!gp.alive) {
++		printf(GP_PFX "VERDICT (c): GPU block NOT alive (cx=%u gx=%u "
++		    "root=%u core_clk=%u); the power/clock path is wrong, next "
++		    "step is the GX clock/RPMh vote\n", gp.cx_ok, gp.gx_ok,
++		    gp.root_ok, gp.core_clk_ok);
++		return;
++	}
++	if (!gp.gx_ok || !gp.core_clk_ok) {
++		printf(GP_PFX "note: RBBM answers even though gx=%u core_clk=%u; "
++		    "trust the RBBM read, not the status bits\n",
++		    gp.gx_ok, gp.core_clk_ok);
++	}
++	if (gp.secvid_ok) {
++		printf(GP_PFX "VERDICT (a): GPU ALIVE and SECVID writable "
++		    "(RBBM version 0x%08x); proceed to the CP/firmware stage\n",
++		    gp_rd(gp.kgsl, GP_RBBM_HW_VERSION));
++	} else {
++		printf(GP_PFX "VERDICT (b): GPU ALIVE but the SECVID write was "
++		    "blocked; the zap/SMC sub-project is required\n");
++	}
++}
++
++static void
++gp_run(void)
++{
++	printf(GP_PFX "--- probe start ---\n");
++
++	gp.gpucc = ml_io_map(GP_GPUCC_PA, GP_GPUCC_SZ);
++	gp.kgsl = ml_io_map(GP_KGSL_PA, GP_KGSL_SZ);
++	gp.smmu = ml_io_map(GP_SMMU_PA, GP_SMMU_SZ);
++	gp.gcc = ml_io_map(GP_GCC_PA, GP_GCC_SZ);
++	if (!gp.gpucc || !gp.kgsl || !gp.smmu || !gp.gcc) {
++		printf(GP_PFX "ml_io_map failed (gpucc=%#lx kgsl=%#lx smmu=%#lx "
++		    "gcc=%#lx); nothing touched\n", (unsigned long)gp.gpucc,
++		    (unsigned long)gp.kgsl, (unsigned long)gp.smmu,
++		    (unsigned long)gp.gcc);
++		return;
++	}
++
++	gp_snapshot();
++
++	gp_clock_cxo();
++	gp_clock_ahb();
++
++	if (gp_gdsc_cx() != 0) {
++		printf(GP_PFX "stopping after the CX domain: without it "
++		    "nothing else in the GPU can be clocked\n");
++		gp_verdict();
++		return;
++	}
++	gp.cx_ok = true;
++
++	gp.root_ok = (gp_root_clock() == 0);
++	if (!gp.root_ok) {
++		printf(GP_PFX "GX root clock did not come up; enabling GX "
++		    "anyway so the log shows what the block does\n");
++	}
++
++	gp.gx_ok = (gp_gdsc_gx() == 0);
++	if (!gp.gx_ok) {
++		printf(GP_PFX "gdsc_gpu_gx did not report PWR_ON\n");
++	}
++
++	/* The core clock branch; without it RBBM is not clocked. */
++	gp.core_clk_ok = gp_branch_on(gp.gpucc, GP_GPUCC_GFX3D_CBCR,
++	    "gpucc_gfx3d_clk CBCR");
++
++	gp_rbbm();
++	gp_smmu();
++
++	gp_verdict();
++	printf(GP_PFX "--- probe end ---\n");
++}
++
++/* ------------------------------------------------------------------ */
++/* Thread + entry point                                               */
++/* ------------------------------------------------------------------ */
++static void
++gp_sleep_s(unsigned s)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(s, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&gp_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++gp_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	gp_sleep_s(gp.delay_s);
++	gp_run();
++	printf(GP_PFX "thread exiting\n");
++	(void)thread_terminate(current_thread());
++}
++
++void
++sweet_gpuprobe_init(void)
++{
++	int enabled = 0;
++	int delay_s = 10;
++	thread_t thread;
++
++	if (gp_started) {
++		return;
++	}
++	gp_started = 1;
++
++	(void)PE_parse_boot_argn("sweetgpuprobe", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("sweetgpuprobedelay", &delay_s,
++	    sizeof(delay_s));
++
++	if (!enabled) {
++		printf(GP_PFX "disabled (sweetgpuprobe=0)\n");
++		return;
++	}
++	if (delay_s < 1) {
++		delay_s = 1;
++	}
++	if (delay_s > 120) {
++		delay_s = 120;
++	}
++	gp.delay_s = (unsigned)delay_s;
++
++	/* Mapping and the first register read both happen inside the thread,
++	 * so a wrong window can only take down a boot that asked for the
++	 * probe, not the default boot. */
++	printf(GP_PFX "enabled: running in %u s\n", gp.delay_s);
++
++	kern_return_t kr = kernel_thread_start(gp_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf(GP_PFX "kernel_thread_start failed %d; probe not run\n",
++		    kr);
++	}
++}
++#else /* !ARM64_BOARD_CONFIG_SAGIT */
++/*
++ * The addresses above are MSM8998's.  Other boards in this tree (sweet,
++ * SM7150) must not touch them, so the symbol still exists but does nothing.
++ */
++void
++sweet_gpuprobe_init(void)
++{
++}
++#endif /* ARM64_BOARD_CONFIG_SAGIT */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index d93c78b..05e9a4a 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,8 @@ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ /* MSM8998 (sagit) power key, off unless sweetpowerkey=1 / sweetkeepawake=N */
+ extern void sweet_powerkey_init(void);
++/* MSM8998 (sagit) Adreno 540 liveness probe, off unless sweetgpuprobe=1 */
++extern void sweet_gpuprobe_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -662,6 +664,7 @@ sweet_ufs_init(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_powerkey_init();
++	sweet_gpuprobe_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
