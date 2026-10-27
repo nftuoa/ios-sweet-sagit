@@ -11,25 +11,19 @@ index 6630131..a5a0bc4 100644
  bsd/dev/sweet_spmi.c			standard
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index 03defe6..d92aefb 100644
+index 03defe6..80fdf77 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -5,7 +5,13 @@
+@@ -5,7 +5,7 @@
   * No firmware/config upload or direct PMIC writes. Only IC data write:
   * zero to GT9896's event status after reading a report. See touch2/report.md.
   */
 -#if defined(ARM64_BOARD_CONFIG_SWEET)
-+/*
-+ * SAGIT (MSM8998) has its own implementation in bsd/dev/sweet_touch_sagit.c:
-+ * this file drives the SM7150 GENI SE7 at 0xa84000 and TLMM pins 8/9/90,
-+ * none of which exist on MSM8998. Exactly one of the two provides
-+ * sweet_touch_init() for a given board.
-+ */
 +#if defined(ARM64_BOARD_CONFIG_SWEET) && !defined(ARM64_BOARD_CONFIG_SAGIT)
  #include <sys/param.h>
  #include <sys/systm.h>
  #include <sys/errno.h>
-@@ -657,4 +663,10 @@ sweet_touch_init(void)
+@@ -657,4 +657,4 @@ sweet_touch_init(void)
  		printf("SWEET TOUCH: kernel_thread_start failed %d\n", kr);
  	}
  }
@@ -37,10 +31,10 @@ index 03defe6..d92aefb 100644
 +#endif /* ARM64_BOARD_CONFIG_SWEET && !ARM64_BOARD_CONFIG_SAGIT */
 diff --git a/bsd/dev/sweet_touch_sagit.c b/bsd/dev/sweet_touch_sagit.c
 new file mode 100644
-index 0000000..c75a214
+index 0000000..6af01c7
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_sagit.c
-@@ -0,0 +1,1062 @@
+@@ -0,0 +1,1087 @@
 +/*
 + * SAGIT (Xiaomi Mi 6, MSM8998) touch bring-up: BLSP1 QUP5 I2C master +
 + * polled Synaptics DSX (RMI4 over I2C) report reader.
