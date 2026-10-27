@@ -1,0 +1,588 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index a5a0bc4..24c552d 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_touch_sagit.c		standard
++bsd/dev/sweet_powerkey.c		standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_powerkey.c b/bsd/dev/sweet_powerkey.c
+new file mode 100644
+index 0000000..729a2bf
+--- /dev/null
++++ b/bsd/dev/sweet_powerkey.c
+@@ -0,0 +1,549 @@
++/*
++ * SAGIT (Xiaomi Mi 6, MSM8998) power key: polled PM8998 PON status bit over
++ * the SPMI PMIC arbiter, delivered as the iOS consumer-control power usage.
++ *
++ * Why a new file instead of sweet_keys.c: that driver talks to the SM7150
++ * PMIC arbiter (core 0x0c440000 / observer 0x0e600000 / cnfg 0x0c40a000).
++ * None of those addresses exists on MSM8998.  Decoding stock-sagit.dtb and
++ * sorting every reg range, no node covers 0x0c440000, 0x0c40a000 or
++ * 0x0e600000; the blocks in that window are 0x0c010000..0x0c016000,
++ * 0x0c0a4000, 0x0c144000, 0x0c16f000..0x0c1e9000, 0x0c828000..0x0c9e1000
++ * and 0x0ca00020..0x0cd00000.  So the first MMIO access is an access to a
++ * hole; and even with the right address the sweet decode is arbiter-v5-only
++ * (see below).  sweetkeys=0 stays in every cmdline; this file is
++ * independent and off unless sweetpowerkey=1.
++ *
++ * Facts this driver is built on (all verified from files in the tree, see
++ * mi6/docs/4k/power-key.md for the full derivation):
++ *
++ *  - SPMI PMIC arbiter: /soc/qcom,spmi@800f000 in stock-sagit.dtb
++ *      reg-names = "core"   "chnls"    "obsrvr"    "intr"     "cnfg"
++ *      reg       = <0x800f000 0x1000 0x8400000 0x1000000
++ *                   0x9400000 0x1000000 0xa400000 0x220000
++ *                   0x800a000 0x3000>
++ *      qcom,ee = <0>  qcom,channel = <0>  interrupts = <0 0x146 0>
++ *
++ *  - Arbiter version: **v3**, not v5.  The phone's own Android boot log
++ *    (mi6/logs/dmesg-android.txt:148) says
++ *        spmi spmi-0: PMIC arbiter version v3 (0x30000000)
++ *    v3 (Xiaomi drivers/spmi/spmi-pmic-arb.c, pmic_arb_v3) uses
++ *      read channel   0x1000*ee + 0x8000*apid  in "obsrvr"
++ *      rw   channel   0x1000*ee + 0x8000*apid  in "chnls"
++ *      PPID->APID map "core" + 0x800 + 4*apid   (channel_map_offset_v2)
++ *      EE ownership   "cnfg" + 0x700 + 4*apid   (SPMI_OWNERSHIP_TABLE_REG)
++ *    v5 (the layout bsd/dev/sweet_spmi.c implements) uses 0x80*apid for the
++ *    observer window and map at "core" + 0x900 instead, and requires
++ *    version >= 0x50000000 - which is why sweet_spmi_init() refuses this
++ *    board and why the battery path never gets real PMIC data on sagit.
++ *    The command word is identical in v2/v3/v5 (pmic_arb_fmt_cmd_v2):
++ *        cmd = (opcode << 27) | ((addr & 0xff) << 4) | (byte_count & 7)
++ *    and the per-channel registers are the same: CMD 0x00, STATUS 0x08
++ *    (DONE bit0, FAILURE bit1, DENIED bit2, DROPPED bit3), RDATA0 0x18.
++ *    Opcode 1 = EXT_READL, byte_count 0 = one byte.  Vendor timeout 100 us.
++ *
++ *  - PON: /soc/qcom,spmi@800f000/qcom,pm8998@0/qcom,power-on@800
++ *    reg = <0x800 0x100>  => SPMI SID 0, peripheral 0x08, PPID 0x008.
++ *    interrupt-names = "kpdpwr" "resin" "resin-bark" "kpdpwr-resin-bark"
++ *    at <0 0x08 0>, <0 0x08 1>, <0 0x08 4>, <0 0x08 5>.
++ *    Android agrees: "qcom,qpnp-power-on 800f000.qcom,spmi:qcom,pm8998@0:
++ *    qcom,power-on@800: PMIC@SID0 Power-on reason: ..." (dmesg-android:252).
++ *
++ *  - PON register semantics (Xiaomi drivers/input/misc/qpnp-power-on.c):
++ *      QPNP_PON_RT_STS(pon) = base + 0x10   => 0x810 here
++ *      QPNP_PON_KPDPWR_N_SET        BIT(0)
++ *      QPNP_PON_RESIN_N_SET         BIT(1)
++ *      QPNP_PON_CBLPWR_N_SET        BIT(2)
++ *      QPNP_PON_RESIN_BARK_N_SET    BIT(4)
++ *      QPNP_PON_KPDPWR_RESIN_BARK_N_SET BIT(5)
++ *    A bit is 1 while that key is asserted: qpnp_pon_input_dispatch() feeds
++ *    "pon_rt_sts & pon_rt_bit" straight to input_report_key(), and the
++ *    "collect D-state before long comb key" path tests (rt_sts & 3) == 3
++ *    for "power and reset held together".  The line is pulled up
++ *    (qcom,pull-up in pon_1), so the bit is the debounced logical state,
++ *    not the raw pin level.
++ *
++ *  - Long press is entirely PMIC-owned: pon_1 has qcom,support-reset,
++ *    qcom,s1-timer = 0x1180, qcom,s2-timer = 0x7d0, qcom,s2-type = 7
++ *    (hard reset), qcom,pon-dbc-delay = 0xf424 (62500 us).  This driver
++ *    never writes a PMIC register, so holding the key still hard-resets the
++ *    SoC exactly as on Android; that is deliberate.
++ *
++ * Design:
++ *  - polled, no interrupts (the PMIC IRQ needs the arbiter's intr block and
++ *    a GIC SPI we have not validated), one kernel thread every 20 ms;
++ *  - a key-down edge sends the iOS "power" button as consumer page 0x0C
++ *    usage 0x30 through sweet_hid_key() - the same IOHIDEventService path
++ *    the working Home key uses - press now, release 100 ms later;
++ *  - read only: the only bus transaction is EXT_READL of 0x810;
++ *  - boot args (all default off, so a plain boot is untouched):
++ *      sweetpowerkey=1            enable the power key
++ *      sweetkeepawake=<seconds>   inject a benign HID event every N seconds
++ *      sweetkeepawakekey=1        use the Home/Menu key instead of a touch
++ *      sweetkeepawakex/-y=<px>    tap position (default 540,960 = panel
++ *                                 centre of the 1080x1920 panel 0119 leaves)
++ *  - non-fatal: a failed probe or repeated read failures disable the power
++ *    key with one log line; the keep-awake ticker keeps running.
++ */
++#if defined(ARM64_BOARD_CONFIG_SAGIT)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* iokit/Kernel/arm/hid/SweetHID.cpp */
++extern void sweet_hid_key(int key, int down);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_powerkey_init(void);
++
++/* ------------------------------------------------------------------ */
++/* MSM8998 PMIC arbiter, stock device tree                             */
++/* ------------------------------------------------------------------ */
++#define PK_ARB_CORE_PA   0x0800f000u
++#define PK_ARB_CORE_SZ   0x00001000u
++#define PK_ARB_CNFG_PA   0x0800a000u
++#define PK_ARB_CNFG_SZ   0x00001000u
++#define PK_ARB_OBS_PA    0x09400000u
++#define PK_ARB_EE        0u
++/* chnls (0x08400000) is deliberately never mapped: this driver only reads. */
++
++/* pmic_arb_ver_ops: channel_map_offset and the PPID map base per version. */
++#define PK_ARB_V2_MIN    0x20010000u
++#define PK_ARB_V3_MIN    0x30000000u
++#define PK_ARB_V5_MIN    0x50000000u
++#define PK_ARB_V_MAX     0x70000000u  /* same upper bound as sweet_spmi.c  */
++#define PK_ARB_MAP_V2    0x0800u      /* core + 0x800 + 4*apid, v1/v2/v3   */
++#define PK_ARB_MAP_V5    0x0900u      /* core + 0x900 + 4*apid, v5         */
++#define PK_ARB_OWNER     0x0700u      /* cnfg + 0x700 + 4*apid             */
++#define PK_ARB_RESERVED_CHAN 0x1ffu   /* qcom,reserved-chan in the DTB      */
++#define PK_ARB_PPID_SHIFT 8
++#define PK_ARB_PPID_MASK 0x0fffu
++#define PK_ARB_OWNER_MASK 0x7u
++#define PK_ARB_MAX_APID  512u
++
++/* Per-channel registers, same offsets in every arbiter version. */
++#define PK_CH_CMD        0x00u
++#define PK_CH_STATUS     0x08u
++#define PK_CH_RDATA0     0x18u
++#define PK_ST_DONE       0x01u
++#define PK_ST_ERROR      0x0eu        /* FAILURE | DENIED | DROPPED         */
++#define PK_OP_EXT_READL  1u
++
++/* ------------------------------------------------------------------ */
++/* PM8998 PON (SID 0, peripheral 0x08, base 0x800)                     */
++/* ------------------------------------------------------------------ */
++#define PK_PON_SID           0u
++#define PK_PON_PERIPH        0x08u
++#define PK_PON_PPID          ((PK_PON_SID << 8) | PK_PON_PERIPH)
++#define PK_PON_RT_STS        0x810u   /* base 0x800 + QPNP_PON_RT_STS 0x10 */
++#define PK_PON_RT_STS_ADDR   (PK_PON_RT_STS & 0xffu)  /* addr low byte     */
++#define PK_KPDPWR_N          0x01u
++#define PK_RESIN_N           0x02u
++#define PK_CBLPWR_N          0x04u
++#define PK_RESIN_BARK_N      0x10u
++#define PK_KPDPWR_RESIN_BARK_N 0x20u
++
++/* HID: sweet_hid_key(0, ...) is kHIDUsage_Csmr_Power (page 0x0C, usage 0x30) */
++#define PK_HID_POWER         0
++#define PK_HID_HOME          3
++#define PK_HID_FINGER        0
++/* Panel centre (1080x1920; 0119 publishes the panel natively). */
++#define PK_KA_X              540
++#define PK_KA_Y              960
++
++/* Polling / timing */
++#define PK_POLL_MS           20u
++#define PK_DEBOUNCE_SAMPLES  2u       /* 40 ms of a stable level           */
++#define PK_PRESS_MS          100u     /* synthetic press -> release        */
++#define PK_READ_TRIES        1000u    /* delay(1) is 1 us: ~1 ms worst case */
++#define PK_MAX_ERRORS        50u      /* 1 s of continuous failure         */
++
++#define PK_APID_NONE         0xffffffffu
++
++struct pk_state {
++	vm_offset_t arb;              /* core, 0x1000                      */
++	vm_offset_t cnfg;             /* 0x1000                            */
++	vm_offset_t obs;              /* one 4 KiB page holding our channel */
++	uint32_t    obs_off;          /* channel offset inside that page   */
++	uint32_t    version;
++	uint32_t    apid;
++	uint32_t    owner;
++	bool        v5;
++	bool        poll;             /* power-key polling enabled         */
++	bool        synced;           /* first sample consumed             */
++	bool        raw;              /* last read level                   */
++	bool        down;             /* debounced level                   */
++	unsigned    stable;           /* samples at `raw`                  */
++	unsigned    errors;
++	unsigned long long release_at;
++	/* keep-awake */
++	int         ka_secs;
++	int         ka_key;
++	int         ka_x;
++	int         ka_y;
++	unsigned long long ka_next;
++	unsigned long long ka_release_at;
++	bool        ka_use_key;
++};
++
++static struct pk_state pk;
++static int pk_started;
++static int pk_sleep_chan;
++
++static uint32_t
++pk_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t value = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return value;
++}
++
++/* 20 ms of sleep on a private wait channel (same idiom as sweet_keys.c). */
++static void
++pk_wait(void)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(PK_POLL_MS, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&pk_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* One EXT_READL of PON_RT_STS through our APID's observer channel. */
++static int
++pk_pon_rt_sts(uint32_t *out)
++{
++	vm_offset_t regs = pk.obs + pk.obs_off;
++	uint32_t cmd = (PK_OP_EXT_READL << 27) | (PK_PON_RT_STS_ADDR << 4);
++
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(regs + PK_CH_CMD) = cmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++
++	for (unsigned i = 0; i < PK_READ_TRIES; ++i) {
++		uint32_t status = pk_rd(regs, PK_CH_STATUS);
++		if (status & PK_ST_DONE) {
++			if (status & PK_ST_ERROR) {
++				return -1;
++			}
++			*out = pk_rd(regs, PK_CH_RDATA0) & 0xffu;
++			return 0;
++		}
++		delay(1);
++	}
++	return -1;
++}
++
++/*
++ * Find the APID that carries PPID 0x008 (SID 0 / PON).  On v2/v3 the table
++ * is an APID->PPID map in "core"; entries owned by another execution
++ * environment are usable for reads but we prefer ours (EE 0 = APPS).
++ */
++static uint32_t
++pk_find_apid(uint32_t *owner_out)
++{
++	uint32_t map_base = pk.v5 ? PK_ARB_MAP_V5 : PK_ARB_MAP_V2;
++	uint32_t count = (PK_ARB_CORE_SZ - map_base) / 4u;
++	uint32_t first = PK_APID_NONE;
++
++	if (count > PK_ARB_MAX_APID) {
++		count = PK_ARB_MAX_APID;
++	}
++	for (uint32_t i = 0; i < count; ++i) {
++		uint32_t entry, owner;
++
++		if (i == PK_ARB_RESERVED_CHAN) {
++			continue;	/* the reserved channel has no PPID */
++		}
++		entry = pk_rd(pk.arb, map_base + 4u * i);
++		if (!entry || ((entry >> PK_ARB_PPID_SHIFT) & PK_ARB_PPID_MASK) !=
++		    PK_PON_PPID) {
++			continue;
++		}
++		owner = pk_rd(pk.cnfg, PK_ARB_OWNER + 4u * i) & PK_ARB_OWNER_MASK;
++		if (first == PK_APID_NONE) {
++			first = i;
++			*owner_out = owner;
++		}
++		if (owner == PK_ARB_EE) {
++			*owner_out = owner;
++			return i;
++		}
++	}
++	return first;
++}
++
++/* Map the arbiter, find the PON channel and prove we can read 0x810. */
++static int
++pk_probe(void)
++{
++	uint32_t sts = 0;
++	uint32_t chan;
++
++	pk.arb = ml_io_map(PK_ARB_CORE_PA, PK_ARB_CORE_SZ);
++	pk.cnfg = ml_io_map(PK_ARB_CNFG_PA, PK_ARB_CNFG_SZ);
++	if (!pk.arb || !pk.cnfg) {
++		printf("SWEET POWERKEY: MMIO mapping of the PMIC arbiter failed; "
++		    "power key disabled\n");
++		return -1;
++	}
++
++	pk.version = pk_rd(pk.arb, 0);
++	/* v1 walks a PPID tree in cnfg 0xB00 and has a per-EE channel only
++	 * (MSM8998 is v3), so anything outside v2..v6 is refused before the
++	 * first observer access rather than guessed at. */
++	if (pk.version < PK_ARB_V2_MIN || pk.version >= PK_ARB_V_MAX) {
++		printf("SWEET POWERKEY: unexpected PMIC arbiter version %#x; "
++		    "power key disabled\n", pk.version);
++		return -1;
++	}
++	pk.v5 = pk.version >= PK_ARB_V5_MIN;
++	printf("SWEET POWERKEY: SPMI PMIC arbiter v%d (%#x) core=%#x cnfg=%#x "
++	    "obs=%#x ee=%u\n",
++	    pk.v5 ? 5 : (pk.version >= PK_ARB_V3_MIN ? 3 : 2),
++	    pk.version, (unsigned)PK_ARB_CORE_PA, (unsigned)PK_ARB_CNFG_PA,
++	    (unsigned)PK_ARB_OBS_PA, (unsigned)PK_ARB_EE);
++
++	pk.apid = pk_find_apid(&pk.owner);
++	if (pk.apid == PK_APID_NONE) {
++		printf("SWEET POWERKEY: no APID maps PPID %#x (SID %u periph "
++		    "%#x); power key disabled\n", PK_PON_PPID, PK_PON_SID,
++		    PK_PON_PERIPH);
++		return -1;
++	}
++
++	/* v2/v3: 0x1000*ee + 0x8000*apid in "obsrvr"; v5: 0x10000*ee + 0x80*apid. */
++	chan = pk.v5 ?
++	    (0x10000u * (uint32_t)PK_ARB_EE + 0x80u * pk.apid) :
++	    (0x1000u * (uint32_t)PK_ARB_EE + 0x8000u * pk.apid);
++	pk.obs = ml_io_map(PK_ARB_OBS_PA + (chan & ~0xfffu), 0x1000);
++	if (!pk.obs) {
++		printf("SWEET POWERKEY: MMIO mapping of observer channel %u "
++		    "failed; power key disabled\n", pk.apid);
++		return -1;
++	}
++	pk.obs_off = chan & 0xfffu;
++
++	printf("SWEET POWERKEY: PPID %#x -> APID %u (EE owner %u), observer "
++	    "channel %#x (page %#x+%#x)\n", PK_PON_PPID, pk.apid, pk.owner,
++	    (unsigned)(PK_ARB_OBS_PA + chan),
++	    (unsigned)(PK_ARB_OBS_PA + (chan & ~0xfffu)), pk.obs_off);
++
++	if (pk_pon_rt_sts(&sts) != 0) {
++		printf("SWEET POWERKEY: PON read of %#x timed out; power key "
++		    "disabled\n", PK_PON_RT_STS);
++		return -1;
++	}
++	printf("SWEET POWERKEY: PON_RT_STS(%#x)=%#x kpdpwr=%u resin=%u "
++	    "cblpwr=%u resin-bark=%u kpdpwr-resin-bark=%u\n",
++	    PK_PON_RT_STS, sts, !!(sts & PK_KPDPWR_N), !!(sts & PK_RESIN_N),
++	    !!(sts & PK_CBLPWR_N), !!(sts & PK_RESIN_BARK_N),
++	    !!(sts & PK_KPDPWR_RESIN_BARK_N));
++	return 0;
++}
++
++/*
++ * One 20 ms poll.  The first sample only seeds the state: a key that is
++ * already held when the driver attaches (or a stale PMIC state) must not
++ * lock the device at boot.
++ */
++static void
++pk_poll(unsigned long long now)
++{
++	uint32_t sts = 0;
++	bool down;
++
++	if (pk_pon_rt_sts(&sts) != 0) {
++		if (++pk.errors == 1) {
++			printf("SWEET POWERKEY: PON read failed; retrying\n");
++		}
++		if (pk.errors >= PK_MAX_ERRORS) {
++			pk.poll = false;
++			printf("SWEET POWERKEY: polling stopped after %u "
++			    "consecutive PON read failures\n", pk.errors);
++		}
++		return;
++	}
++	if (pk.errors) {
++		printf("SWEET POWERKEY: PON read recovered after %u errors\n",
++		    pk.errors);
++		pk.errors = 0;
++	}
++
++	down = (sts & PK_KPDPWR_N) != 0;
++	if (!pk.synced) {
++		pk.synced = true;
++		pk.raw = down;
++		pk.down = down;
++		pk.stable = 0;
++		printf("SWEET POWERKEY: initial PON_RT_STS=%#x kpdpwr=%d\n",
++		    sts, down);
++		return;
++	}
++
++	if (down != pk.raw) {
++		pk.raw = down;
++		pk.stable = 0;
++	} else if (pk.stable < 100u) {
++		pk.stable++;
++	}
++
++	if (pk.stable == PK_DEBOUNCE_SAMPLES && pk.down != pk.raw) {
++		pk.down = pk.raw;
++		if (pk.down) {
++			printf("SWEET POWERKEY: kpdpwr down (PON_RT_STS=%#x): "
++			    "HID consumer 0x30 press\n", sts);
++			sweet_hid_key(PK_HID_POWER, 1);
++			pk.release_at = now + PK_PRESS_MS;
++		} else {
++			printf("SWEET POWERKEY: kpdpwr up (PON_RT_STS=%#x)\n",
++			    sts);
++		}
++	}
++}
++
++/*
++ * Optional keep-awake for when the power key is not usable yet: a real
++ * (tiny) HID event every N seconds so SpringBoard's idle timer keeps being
++ * reset.  sweetkeepawakekey=1 sends the Home/Menu key instead of a tap.
++ */
++static void
++pk_keepawake(unsigned long long now)
++{
++	if (now < pk.ka_next) {
++		return;
++	}
++	pk.ka_next = now + (unsigned long long)pk.ka_secs * 1000u / PK_POLL_MS;
++
++	if (pk.ka_key) {
++		printf("SWEET KEEPAWAKE: HID menu press (every %d s)\n",
++		    pk.ka_secs);
++		sweet_hid_key(PK_HID_HOME, 1);
++		pk.ka_use_key = true;
++	} else {
++		printf("SWEET KEEPAWAKE: 1 px touch at %d,%d (every %d s)\n",
++		    pk.ka_x, pk.ka_y, pk.ka_secs);
++		sweet_hid_touch(PK_HID_FINGER, 1, pk.ka_x, pk.ka_y);
++		pk.ka_use_key = false;
++	}
++	pk.ka_release_at = now + PK_PRESS_MS;
++}
++
++static void
++pk_thread(void *arg, wait_result_t result)
++{
++	unsigned long long now = 0;
++
++	(void)arg;
++	(void)result;
++
++	for (;;) {
++		if (pk.poll) {
++			pk_poll(now);
++		}
++		if (pk.release_at && now >= pk.release_at) {
++			pk.release_at = 0;
++			sweet_hid_key(PK_HID_POWER, 0);
++			printf("SWEET POWERKEY: HID consumer 0x30 release "
++			    "(%u ms)\n", PK_PRESS_MS);
++		}
++		if (pk.ka_secs) {
++			if (pk.ka_release_at && now >= pk.ka_release_at) {
++				pk.ka_release_at = 0;
++				if (pk.ka_use_key) {
++					sweet_hid_key(PK_HID_HOME, 0);
++				} else {
++					sweet_hid_touch(PK_HID_FINGER, 1,
++					    pk.ka_x + 1, pk.ka_y);
++					sweet_hid_touch(PK_HID_FINGER, 0,
++					    pk.ka_x + 1, pk.ka_y);
++				}
++			} else if (!pk.ka_release_at) {
++				pk_keepawake(now);
++			}
++		}
++		now += PK_POLL_MS;
++		pk_wait();
++	}
++}
++
++void
++sweet_powerkey_init(void)
++{
++	thread_t thread;
++	int powerkey = 0;
++
++	if (pk_started) {
++		return;
++	}
++	pk_started = 1;
++
++	(void)PE_parse_boot_argn("sweetpowerkey", &powerkey, sizeof(powerkey));
++	(void)PE_parse_boot_argn("sweetkeepawake", &pk.ka_secs,
++	    sizeof(pk.ka_secs));
++	(void)PE_parse_boot_argn("sweetkeepawakekey", &pk.ka_key,
++	    sizeof(pk.ka_key));
++	(void)PE_parse_boot_argn("sweetkeepawakex", &pk.ka_x, sizeof(pk.ka_x));
++	(void)PE_parse_boot_argn("sweetkeepawakey", &pk.ka_y, sizeof(pk.ka_y));
++
++	if (pk.ka_secs < 0) {
++		pk.ka_secs = 0;
++	}
++	if (pk.ka_secs > 0 && pk.ka_secs < 10) {
++		pk.ka_secs = 10;	/* 10 s floor: do not flood the HID path */
++	}
++	if (!powerkey && !pk.ka_secs) {
++		printf("SWEET POWERKEY: disabled (sweetpowerkey=0 "
++		    "sweetkeepawake=0)\n");
++		return;
++	}
++	if (!pk.ka_x) {
++		pk.ka_x = PK_KA_X;
++	}
++	if (!pk.ka_y) {
++		pk.ka_y = PK_KA_Y;
++	}
++	if (pk.ka_x < 0 || pk.ka_x > 1079) {
++		pk.ka_x = PK_KA_X;
++	}
++	if (pk.ka_y < 0 || pk.ka_y > 1919) {
++		pk.ka_y = PK_KA_Y;
++	}
++
++	if (powerkey && pk_probe() == 0) {
++		pk.poll = true;
++		printf("SWEET POWERKEY: polling PON %#x every %u ms, "
++		    "kpdpwr -> HID consumer 0x30 press+release\n",
++		    PK_PON_RT_STS, PK_POLL_MS);
++	} else if (powerkey) {
++		printf("SWEET POWERKEY: power key disabled (probe failed)\n");
++	}
++
++	if (pk.ka_secs) {
++		pk.ka_next = (unsigned long long)pk.ka_secs * 1000u / PK_POLL_MS;
++		printf("SWEET KEEPAWAKE: enabled every %d s (%s at %d,%d)\n",
++		    pk.ka_secs, pk.ka_key ? "Home key" : "1 px touch",
++		    pk.ka_x, pk.ka_y);
++	}
++
++	kern_return_t kr = kernel_thread_start(pk_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET POWERKEY: kernel_thread_start failed %d\n", kr);
++	}
++}
++#else /* !ARM64_BOARD_CONFIG_SAGIT */
++/*
++ * The addresses above are MSM8998's.  Other boards in this tree (sweet,
++ * SM7150) keep sweetkeys=0 and must not call into them, so the symbol still
++ * exists but does nothing.
++ */
++void
++sweet_powerkey_init(void)
++{
++}
++#endif /* ARM64_BOARD_CONFIG_SAGIT */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 93d1aaf..d93c78b 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,8 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++/* MSM8998 (sagit) power key, off unless sweetpowerkey=1 / sweetkeepawake=N */
++extern void sweet_powerkey_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -659,6 +661,7 @@ sweet_ufs_init(void)
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++	sweet_powerkey_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
