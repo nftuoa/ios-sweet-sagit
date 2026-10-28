@@ -90,7 +90,7 @@ index 0000000..a4c0d2a
 + *    two bits each, 0 = SCM_VAL (plain value), 1 = SCM_RO, 2 = SCM_RW,
 + *    3 = SCM_BUFVAL (scm.h:56-61).  So:
 + *        SCM_ARGS(1)               = 0x00000001
-+ *        SCM_ARGS(2, VAL, RW)      = 0x00000042
++ *        SCM_ARGS(2, VAL, RW)      = 0x00000082
 + *        SCM_ARGS(3)               = 0x00000003
 + *    Only 4 arguments fit in registers (N_REGISTER_ARGS = 4, scm.c:54);
 + *    everything past args[3] travels in the x5 buffer (scm.c:597-637), which
@@ -103,7 +103,7 @@ index 0000000..a4c0d2a
 + *        PAS_AUTH_AND_RESET_CMD  = 5   fn 0x02000205
 + *        PAS_SHUTDOWN_CMD        = 6   fn 0x02000206
 + *    and their exact descriptors:
-+ *        init_image      : arginfo SCM_ARGS(2, SCM_VAL, SCM_RW) = 0x42,
++ *        init_image      : arginfo SCM_ARGS(2, SCM_VAL, SCM_RW) = 0x82,
 + *                          args[0] = pas_id, args[1] = physical address of
 + *                          the image metadata buffer (:582-643).
 + *        mem_setup       : arginfo SCM_ARGS(3) = 0x3,
@@ -197,7 +197,7 @@ index 0000000..a4c0d2a
 +#define SCM_SVC_INFO		0x6u
 +
 +#define SCM_ARGS1		0x00000001ull	/* SCM_ARGS(1)          */
-+#define SCM_ARGS2_VAL_RW	0x00000042ull	/* SCM_ARGS(2, VAL, RW) */
++#define SCM_ARGS2_VAL_RW	0x00000082ull	/* SCM_ARGS(2, VAL, RW) */
 +#define SCM_ARGS3		0x00000003ull	/* SCM_ARGS(3)          */
 +
 +/* drivers/soc/qcom/scm.c:57 and :1150 */
@@ -530,7 +530,7 @@ index 0000000..a4c0d2a
 + *     //    from the kernel's early allocation, dcache flushed, identity
 + *     //    mapped (or at least mapped with the same PA the TZ will see).
 + *
-+ *     // 1. PAS_INIT_IMAGE: fn 0x02000201, arginfo 0x42 (VAL, RW)
++ *     // 1. PAS_INIT_IMAGE: fn 0x02000201, arginfo 0x82 (VAL, RW)
 + *     ret = sweet_scm_smc(SCM_SIP_FNID(SCM_SVC_PIL, SCM_PAS_INIT_IMAGE)
 + *         | SMC64_MASK, SCM_ARGS2_VAL_RW, SCM_PAS_ID_GPU_ZAP,
 + *         (uint64_t)sweet_scm_virt_to_phys(mdata), 0, 0, &r);
