@@ -1,0 +1,604 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index bb9ca65..4453f59 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@ bsd/dev/random/randomdev.c		standard
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
++bsd/dev/sweet_scm.c		standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_touch_sagit.c		standard
+diff --git a/bsd/dev/sweet_scm.c b/bsd/dev/sweet_scm.c
+new file mode 100644
+index 0000000..a4c0d2a
+--- /dev/null
++++ b/bsd/dev/sweet_scm.c
+@@ -0,0 +1,562 @@
++/*
++ * SAGIT (Xiaomi Mi 6, MSM8998) SCM probe -- stage 1 of the TrustZone / PIL
++ * path that has to run before the Adreno 540 can leave secure mode.
++ *
++ * Why this file exists
++ * --------------------
++ * sweet_gpuprobe (patch 0134) proved the GPU block answers: RBBM_HW_VERSION
++ * reads 0x00010042 at 0x05000000, both GDSCs come up, gfx3d is clocked.  It
++ * also proved (patch 0135) that any access to the SECVID window at
++ * 0x0503c000 hangs the bus: the secure world still owns the GPU.  The vendor
++ * kernel releases it by handing a `a540_zap` image to the TZ through PIL over
++ * SCM ("PAS").  Before writing any of that -- buffers, image parser, reset
++ * sequencing -- we need to know whether this kernel can talk to the secure
++ * monitor at all, which SMC convention the monitor wants, and which PAS
++ * commands it implements.
++ *
++ * So this stage issues *only* SCM_SVC_INFO calls whose arguments are plain
++ * values.  Nothing is shared with the TZ, no buffer is passed, no PAS state
++ * is touched, no register is written.  If it works we learn the convention
++ * and the PAS command bitmap; if the monitor rejects it we learn that too,
++ * without side effects.  The PAS sequence itself is written out as a
++ * commented sketch at the bottom of this file for stage 2.
++ *
++ * ---------------------------------------------------------------------------
++ * The SCM ABI, read out of the vendor tree (MiCode/Xiaomi_Kernel_OpenSource,
++ * branch sagit-o-oss).  Line numbers are from that branch:
++ *
++ *  - Conduit: `smc #0`, hardcoded.  There is no DT node, no platform driver,
++ *    no "method"/conduit property and no qcom,dload-mode anywhere in
++ *    drivers/soc/qcom/scm.c: it is a library of exported functions
++ *    (scm_call/scm_call2/... , scm.c:721,808,847...), and the only two
++ *    instructions that ever enter the monitor are the `smc #0` in scm()
++ *    (scm.c:210, the legacy entry) and the `smc #0` in
++ *    __scm_call_armv8_64()/__scm_call_armv8_32() (scm.c:413 / scm.c:462).
++ *
++ *  - Two completely different calling conventions live behind that
++ *    instruction, and the vendor picks at run time in is_scm_armv8()
++ *    (scm.c:556): it first tries the SMC64 form of
++ *    SCM_SVC_INFO/IS_CALL_AVAIL; if that fails it tries the SMC32 form;
++ *    only if both fail does it fall back to SCM_LEGACY (scm.c:571-587).
++ *
++ *    (a) ARMV8 64-bit, used by scm_call2() (scm.c:660) -- this is the one
++ *        PAS uses:
++ *            x0 = fn_id | SMC64_MASK(0x40000000)
++ *            x1 = arginfo (descriptor: arg count + per-arg types)
++ *            x2 = args[0], x3 = args[1], x4 = args[2]
++ *            x5 = args[3], or the physical address of the extra-argument
++ *                 buffer when arginfo's count > 4 (scm.c:602-637)
++ *            x6 = 0
++ *            return: x0 = SCM return code, x1..x3 = ret[0..2]
++ *        scm.c:383-429.
++ *
++ *    (b) ARMV8 32-bit, the same register layout in w0..w5, fn_id without the
++ *        0x40000000 bit; scm.c:432-480.
++ *
++ *    (c) SCM_LEGACY -- what scm_call()/scm_call_atomic*() use: x0 = 1,
++ *        x1 = physical address of a context word, x2 = physical address of a
++ *        struct scm_command {len, buf_offset, resp_hdr_offset, id, buf[]}
++ *        (scm.c:93-99, 195-217).  Only reached when (a) and (b) both fail.
++ *
++ *    scm_call2_atomic() additionally sets BIT(31) in x0
++ *    (SMC_ATOMIC_SYSCALL, scm.c:53,744); PAS init/auth are *not* atomic in
++ *    the vendor (they sleep), so stage 2 must not set it either.
++ *
++ *  - Function-id encoding, include/soc/qcom/scm.h:48:
++ *        SCM_SIP_FNID(svc, cmd) = ((svc & 0xff) << 8) | (cmd & 0xff)
++ *                                 | 0x02000000
++ *    Service numbers (scm.h:15-33): SCM_SVC_PIL = 0x2, SCM_SVC_INFO = 0x6.
++ *
++ *  - arginfo encoding, scm.h:53-76: low 16 bits = number of arguments
++ *    (MAX_SCM_ARGS = 10, scm.h:53); bits [4..23] = one type per argument,
++ *    two bits each, 0 = SCM_VAL (plain value), 1 = SCM_RO, 2 = SCM_RW,
++ *    3 = SCM_BUFVAL (scm.h:56-61).  So:
++ *        SCM_ARGS(1)               = 0x00000001
++ *        SCM_ARGS(2, VAL, RW)      = 0x00000042
++ *        SCM_ARGS(3)               = 0x00000003
++ *    Only 4 arguments fit in registers (N_REGISTER_ARGS = 4, scm.c:54);
++ *    everything past args[3] travels in the x5 buffer (scm.c:597-637), which
++ *    is why the PAS calls below all stay at 3 arguments or fewer.
++ *
++ *  - The calls themselves, drivers/soc/qcom/subsys-pil-tz.c ("pil-tz-generic",
++ *    the driver behind the GPU's qcom,kgsl-hyp node), enum at :116-121:
++ *        PAS_INIT_IMAGE_CMD      = 1   fn 0x02000201
++ *        PAS_MEM_SETUP_CMD       = 2   fn 0x02000202
++ *        PAS_AUTH_AND_RESET_CMD  = 5   fn 0x02000205
++ *        PAS_SHUTDOWN_CMD        = 6   fn 0x02000206
++ *    and their exact descriptors:
++ *        init_image      : arginfo SCM_ARGS(2, SCM_VAL, SCM_RW) = 0x42,
++ *                          args[0] = pas_id, args[1] = physical address of
++ *                          the image metadata buffer (:582-643).
++ *        mem_setup       : arginfo SCM_ARGS(3) = 0x3,
++ *                          args[0] = pas_id, args[1] = phys, args[2] = size,
++ *                          the firmware region TZ may write (:645-680).
++ *        auth_and_reset  : arginfo SCM_ARGS(1) = 0x1, args[0] = pas_id,
++ *                          returns SCM status in ret[0] (:682-726).
++ *        shutdown        : arginfo SCM_ARGS(1) = 0x1, args[0] = pas_id (:728).
++ *    All four return "0" from the monitor on success; a non-zero r0 is the
++ *    SCM transport error and a non-zero ret[0] is the PAS verdict.  The
++ *    vendor maps r0 with scm_remap_error() (scm.c:175) and treats only
++ *    r0 == 0 as "ask ret[0]".
++ *
++ *  - PAS id for the GPU zap shader: 13 (0xd).  arch/arm/boot/dts/qcom/
++ *    msm8998-gpu.dtsi:15-18 --
++ *        pil_gpu: qcom,kgsl-hyp {
++ *            compatible = "qcom,pil-tz-generic";
++ *            qcom,pas-id = <13>;
++ *            qcom,firmware-name = "a540_zap";
++ *        };
++ *    and the kgsl node at :93 carries qcom,zap-shader = "a540_zap".  The
++ *    firmware is read as "a540_zap.mdt" plus "a540_zap.bNN" segments
++ *    (drivers/soc/qcom/peripheral-loader.c:883,763).
++ *
++ *  - There is no SCM_PAS_GET_IMAGEID in this kernel (nothing named
++ *    GET_IMAGEID exists in drivers/soc/qcom at all), and SCM_GET_VERSION is
++ *    not usable as a probe either: it is a legacy-convention call
++ *    (scm.c:1048-1082) that passes a kernel pointer for the monitor to write
++ *    a version into, i.e. it needs shared memory.  The harmless probe this
++ *    file uses instead is SCM_SVC_INFO/IS_CALL_AVAIL (fn 0x02000601), which
++ *    takes one plain value (the fn_id being asked about, scm.c:1122-1148)
++ *    and returns 0/1 in r1 -- and, with fn_id = each PAS command, doubles as
++ *    the "which PAS commands does this monitor implement" query.
++ * ---------------------------------------------------------------------------
++ *
++ * What this stage prints, on a boot with sweetscmprobe=1:
++ *
++ *   SWEET SCM: enabled: probe runs in 10 s
++ *   SWEET SCM: current EL = 1, ID_AA64PFR0_EL1 = 0x..., EL3 implemented
++ *   SWEET SCM: [smc64] IS_CALL_AVAIL(self) fn=0x42000601 arginfo=0x1
++ *              args={0x02000601} -> r0=0x0 r1=0x1 r2=0x0 r3=0x0
++ *   SWEET SCM: using SMC64 (fn_id | 0x40000000)
++ *   SWEET SCM: [smc64] PAS init_image  (svc 0x2 cmd 0x1 fn 0x02000201): available=1
++ *   SWEET SCM: [smc64] PAS mem_setup   (svc 0x2 cmd 0x2 fn 0x02000202): available=1
++ *   SWEET SCM: [smc64] PAS auth_reset  (svc 0x2 cmd 0x5 fn 0x02000205): available=1
++ *   SWEET SCM: [smc64] PAS shutdown    (svc 0x2 cmd 0x6 fn 0x02000206): available=1
++ *   SWEET SCM: [smc64] GET_FEAT_VERSION(feat=0x2) -> r0=0x0 r1=0x00020001
++ *   SWEET SCM: stage-1 done (SMC64)
++ *
++ * ...or, just as useful, "no SMC convention answered" / "EL3 ABSENT", which
++ * means SCM is not reachable from this boot chain and the whole zap idea has
++ * to be re-thought (nothing else in this file runs in that case).
++ *
++ * Boot args:
++ *   sweetscmprobe=1        run the probe (default 0: file does nothing)
++ *   sweetscmprobedelay=<s> seconds to wait first, 1..120, default 10
++ *
++ * Everything is non-fatal by construction: the only thing that can go wrong
++ * beyond a clean error return is the `smc #0` itself trapping, which can
++ * only happen if EL3 is absent or HCR_EL2.TSC traps the instruction -- both
++ * of which the guards below refuse to call into.  The call also runs from a
++ * kernel thread ten seconds after mount, not from early boot, so the console
++ * and the panic log are up if it ever does trap.
++ */
++
++#if defined(ARM64_BOARD_CONFIG_SAGIT)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++#define SCM_PFX			"SWEET SCM: "
++
++/* include/soc/qcom/scm.h:48 */
++#define SCM_SIP_FNID(s, c)	(((((uint64_t)(s)) & 0xff) << 8) | \
++				 (((uint64_t)(c)) & 0xff) | 0x02000000ull)
++
++/* drivers/soc/qcom/scm.c:55-57 */
++#define SMC64_MASK		0x40000000ull
++#define SMC_ATOMIC_BIT		0x80000000ull	/* scm.c:53, BIT(31) */
++
++/* include/soc/qcom/scm.h:15-33, 53-61, 63-76 */
++#define SCM_SVC_PIL		0x2u
++#define SCM_SVC_INFO		0x6u
++
++#define SCM_ARGS1		0x00000001ull	/* SCM_ARGS(1)          */
++#define SCM_ARGS2_VAL_RW	0x00000042ull	/* SCM_ARGS(2, VAL, RW) */
++#define SCM_ARGS3		0x00000003ull	/* SCM_ARGS(3)          */
++
++/* drivers/soc/qcom/scm.c:57 and :1150 */
++#define SCM_INFO_IS_CALL_AVAIL	1u
++#define SCM_INFO_GET_FEAT_VERSION 3u
++
++/* drivers/soc/qcom/subsys-pil-tz.c:116-121 */
++#define SCM_PAS_INIT_IMAGE	1u
++#define SCM_PAS_MEM_SETUP	2u
++#define SCM_PAS_AUTH_AND_RESET	5u
++#define SCM_PAS_SHUTDOWN	6u
++
++/* arch/arm/boot/dts/qcom/msm8998-gpu.dtsi:15-18 */
++#define SCM_PAS_ID_GPU_ZAP	13u
++
++/* drivers/soc/qcom/scm.c:30-37 */
++#define SCM_RET_INTERRUPTED	1
++
++struct sweet_scm_ret {
++	uint64_t	r0;	/* SCM return code            */
++	uint64_t	r1;	/* ret[0] -- PAS verdict, etc */
++	uint64_t	r2;	/* ret[1]                     */
++	uint64_t	r3;	/* ret[2]                     */
++};
++
++static int	sweet_scm_started;
++static unsigned	sweet_scm_delay_s;
++static int	sweet_scm_sleep_chan;
++
++/*
++ * The one instruction that matters.  Same register discipline as
++ * drivers/soc/qcom/scm.c:383-429: x0 = fn (| mask), x1 = arginfo, x2..x4 =
++ * args[0..2], x5 = args[3] (unused here), x6 = 0.  SMCCC lets the monitor
++ * clobber x0..x17, so x7..x17 are declared; x18 is left alone exactly as the
++ * vendor does.  r0 == 1 means "interrupted, call again" (scm.c:214,35).
++ */
++static int
++sweet_scm_smc(uint64_t fn, uint64_t arginfo, uint64_t a0, uint64_t a1,
++    uint64_t a2, uint64_t a3, struct sweet_scm_ret *out)
++{
++	register uint64_t x0 __asm("x0") = fn;
++	register uint64_t x1 __asm("x1") = arginfo;
++	register uint64_t x2 __asm("x2") = a0;
++	register uint64_t x3 __asm("x3") = a1;
++	register uint64_t x4 __asm("x4") = a2;
++	register uint64_t x5 __asm("x5") = a3;
++	register uint64_t x6 __asm("x6") = 0;
++	unsigned tries;
++
++	for (tries = 0; tries < 8; tries++) {
++		__asm__ __volatile__(
++		    "smc #0\n"
++		    : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3),
++		      "+r" (x4), "+r" (x5), "+r" (x6)
++		    :
++		    : "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++		      "x14", "x15", "x16", "x17", "memory");
++
++		if ((int64_t)x0 != SCM_RET_INTERRUPTED) {
++			break;
++		}
++	}
++
++	out->r0 = x0;
++	out->r1 = x1;
++	out->r2 = x2;
++	out->r3 = x3;
++
++	return (int)(int64_t)x0;
++}
++
++static uint64_t
++sweet_scm_current_el(void)
++{
++	uint64_t v;
++
++	__asm__ __volatile__("mrs %0, CurrentEL" : "=r" (v));
++	return (v >> 2) & 0x3;
++}
++
++/* ID_AA64PFR0_EL1.EL3 [15:12]: 0 = EL3 implemented, 1 = not implemented. */
++static int
++sweet_scm_el3_present(void)
++{
++	uint64_t v;
++
++	__asm__ __volatile__("mrs %0, ID_AA64PFR0_EL1" : "=r" (v));
++	return (((v >> 12) & 0xf) == 0);
++}
++
++/*
++ * SCM_SVC_INFO/IS_CALL_AVAIL(svc_id, cmd_id): "does this monitor implement
++ * that call?".  one plain value in, 0/1 in r1.  scm.c:1122-1148.
++ */
++static int
++sweet_scm_is_available(uint64_t mask, uint32_t svc, uint32_t cmd,
++    int *available, struct sweet_scm_ret *raw)
++{
++	uint64_t fn = SCM_SIP_FNID(SCM_SVC_INFO, SCM_INFO_IS_CALL_AVAIL) | mask;
++	struct sweet_scm_ret r;
++	int ret;
++
++	ret = sweet_scm_smc(fn, SCM_ARGS1, SCM_SIP_FNID(svc, cmd), 0, 0, 0, &r);
++	if (raw != NULL) {
++		*raw = r;
++	}
++	if (ret == 0) {
++		*available = (int)(r.r1 & 0xffffffffu);
++	} else {
++		*available = -1;
++	}
++
++	return ret;
++}
++
++static void
++sweet_scm_run(void)
++{
++	uint64_t el = sweet_scm_current_el();
++	uint64_t masks[2];
++	const char *tags[2];
++	uint64_t mask = 0;
++	const char *tag = NULL;
++	struct sweet_scm_ret r;
++	int available;
++	int ret;
++	int i;
++
++	printf(SCM_PFX "current EL = %u, EL3 %s\n", (unsigned)el,
++	    sweet_scm_el3_present() ? "implemented" : "ABSENT");
++
++	if (!sweet_scm_el3_present()) {
++		printf(SCM_PFX "no EL3: smc #0 would be UNDEFINED here; "
++		    "no SMC issued\n");
++		return;
++	}
++	if (el != 1) {
++		/* At EL2 the instruction traps to the hypervisor instead
++		 * (HCR_EL2.TSC), which we have no handler for. */
++		printf(SCM_PFX "not at EL1 (EL%u): refusing to issue smc #0; "
++		    "no SMC issued\n", (unsigned)el);
++		return;
++	}
++
++	masks[0] = SMC64_MASK;
++	tags[0] = "smc64";
++	masks[1] = 0;
++	tags[1] = "smc32";
++
++	/* Which convention does this monitor answer?  Ask it the cheapest
++	 * possible question, both ways, and print both raw results. */
++	for (i = 0; i < 2; i++) {
++		ret = sweet_scm_is_available(masks[i], SCM_SVC_INFO,
++		    SCM_INFO_IS_CALL_AVAIL, &available, &r);
++		printf(SCM_PFX "[%s] IS_CALL_AVAIL(self) fn=0x%llx "
++		    "arginfo=0x%llx args={0x%llx} -> r0=0x%llx r1=0x%llx "
++		    "r2=0x%llx r3=0x%llx\n", tags[i],
++		    (unsigned long long)(SCM_SIP_FNID(SCM_SVC_INFO,
++		    SCM_INFO_IS_CALL_AVAIL) | masks[i]),
++		    (unsigned long long)SCM_ARGS1,
++		    (unsigned long long)SCM_SIP_FNID(SCM_SVC_INFO,
++		    SCM_INFO_IS_CALL_AVAIL),
++		    (unsigned long long)r.r0, (unsigned long long)r.r1,
++		    (unsigned long long)r.r2, (unsigned long long)r.r3);
++		if (ret == 0 && available != 0) {
++			mask = masks[i];
++			tag = tags[i];
++			break;
++		}
++	}
++
++	if (tag == NULL) {
++		printf(SCM_PFX "neither SMC64 nor SMC32 answered "
++		    "IS_CALL_AVAIL; no usable SCM conduit from this kernel\n");
++		return;
++	}
++	printf(SCM_PFX "using %s (fn_id | 0x%llx)\n", tag,
++	    (unsigned long long)mask);
++
++	/* The four PAS commands stage 2 needs, and their ids, answered by the
++	 * monitor itself. */
++	{
++		static const struct {
++			const char	*name;
++			uint32_t	 cmd;
++		} pas[] = {
++			{ "init_image ", SCM_PAS_INIT_IMAGE },
++			{ "mem_setup  ", SCM_PAS_MEM_SETUP },
++			{ "auth_reset ", SCM_PAS_AUTH_AND_RESET },
++			{ "shutdown   ", SCM_PAS_SHUTDOWN },
++		};
++		unsigned n;
++
++		for (n = 0; n < sizeof(pas) / sizeof(pas[0]); n++) {
++			ret = sweet_scm_is_available(mask, SCM_SVC_PIL,
++			    pas[n].cmd, &available, NULL);
++			if (ret != 0) {
++				printf(SCM_PFX "[%s] PAS %s (svc 0x%x cmd "
++				    "0x%x fn 0x%llx): SCM error r0=%d\n", tag,
++				    pas[n].name, SCM_SVC_PIL, pas[n].cmd,
++				    (unsigned long long)SCM_SIP_FNID(
++				    SCM_SVC_PIL, pas[n].cmd), ret);
++				continue;
++			}
++			printf(SCM_PFX "[%s] PAS %s (svc 0x%x cmd 0x%x fn "
++			    "0x%llx): available=%d\n", tag, pas[n].name,
++			    SCM_SVC_PIL, pas[n].cmd,
++			    (unsigned long long)SCM_SIP_FNID(SCM_SVC_PIL,
++			    pas[n].cmd), available);
++		}
++	}
++
++	/* GET_FEAT_VERSION(SCM_SVC_PIL): one value in, version in r1.  Only
++	 * asked for if the monitor says the call exists. */
++	ret = sweet_scm_is_available(mask, SCM_SVC_INFO,
++	    SCM_INFO_GET_FEAT_VERSION, &available, NULL);
++	if (ret == 0 && available != 0) {
++		ret = sweet_scm_smc(SCM_SIP_FNID(SCM_SVC_INFO,
++		    SCM_INFO_GET_FEAT_VERSION) | mask, SCM_ARGS1, SCM_SVC_PIL,
++		    0, 0, 0, &r);
++		printf(SCM_PFX "[%s] GET_FEAT_VERSION(feat=0x%x) -> r0=0x%llx "
++		    "r1=0x%llx (major %llu, minor %llu)\n", tag, SCM_SVC_PIL,
++		    (unsigned long long)r.r0, (unsigned long long)r.r1,
++		    (unsigned long long)((r.r1 >> 16) & 0xffff),
++		    (unsigned long long)(r.r1 & 0xff));
++	} else {
++		printf(SCM_PFX "[%s] GET_FEAT_VERSION not available (r0=%d)\n",
++		    tag, ret);
++	}
++
++	printf(SCM_PFX "stage-1 done (%s); no PAS state was touched\n", tag);
++}
++
++static void
++sweet_scm_sleep_s(unsigned s)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(s, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&sweet_scm_sleep_chan, THREAD_UNINT,
++	    deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++sweet_scm_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	sweet_scm_sleep_s(sweet_scm_delay_s);
++	sweet_scm_run();
++	printf(SCM_PFX "thread exiting\n");
++	(void)thread_terminate(current_thread());
++}
++
++void
++sweet_scm_probe_init(void)
++{
++	int enabled = 0;
++	int delay_s = 10;
++	thread_t thread;
++	kern_return_t kr;
++
++	if (sweet_scm_started) {
++		return;
++	}
++	sweet_scm_started = 1;
++
++	(void)PE_parse_boot_argn("sweetscmprobe", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("sweetscmprobedelay", &delay_s,
++	    sizeof(delay_s));
++
++	if (!enabled) {
++		printf(SCM_PFX "disabled (sweetscmprobe=0)\n");
++		return;
++	}
++	if (delay_s < 1) {
++		delay_s = 1;
++	}
++	if (delay_s > 120) {
++		delay_s = 120;
++	}
++	sweet_scm_delay_s = (unsigned)delay_s;
++
++	printf(SCM_PFX "enabled: probe runs in %u s\n", sweet_scm_delay_s);
++
++	kr = kernel_thread_start(sweet_scm_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf(SCM_PFX "kernel_thread_start failed %d; probe not run\n",
++		    kr);
++	}
++}
++
++/*
++ * ---------------------------------------------------------------------------
++ * Stage 2 sketch -- DO NOT ENABLE.  Everything here is unchecked on this
++ * port; it is written down so the next patch has the descriptors in one
++ * place.  The important shapes are verified (see the header); the buffer
++ * strategy is not.
++ *
++ * The vendor order is: pil_init_image -> pil_mem_setup (per segment) ->
++ * pil_auth_and_reset, driven by pil_ops_trusted in subsys-pil-tz.c:775-782.
++ *
++ * #if 0
++ * static int
++ * sweet_scm_pas_load_gpu_zap(void *mdata, size_t mdata_len, phys_addr_t region,
++ *     size_t region_len)
++ * {
++ *     struct sweet_scm_ret r;
++ *     int ret;
++ *
++ *     // 0. mdata must be a physically contiguous, TZ-readable buffer that
++ *     //    holds the a540_zap.mdt header plus its hash table, byte for byte
++ *     //    as the vendor's pil_mdt parser builds it (peripheral-loader.c:
++ *     //    "%s.mdt"/"%s.b%02d").  Vendor gets it with dma_alloc_attrs(...,
++ *     //    DMA_ATTR_STRONGLY_ORDERED) and kmap_flush_unused() before the
++ *     //    copy (subsys-pil-tz.c:604-621).  In XNU: phys-contiguous memory
++ *     //    from the kernel's early allocation, dcache flushed, identity
++ *     //    mapped (or at least mapped with the same PA the TZ will see).
++ *
++ *     // 1. PAS_INIT_IMAGE: fn 0x02000201, arginfo 0x42 (VAL, RW)
++ *     ret = sweet_scm_smc(SCM_SIP_FNID(SCM_SVC_PIL, SCM_PAS_INIT_IMAGE)
++ *         | SMC64_MASK, SCM_ARGS2_VAL_RW, SCM_PAS_ID_GPU_ZAP,
++ *         (uint64_t)sweet_scm_virt_to_phys(mdata), 0, 0, &r);
++ *     if (ret != 0 || r.r1 != 0) return -1;   // r.r1 = PAS verdict
++ *
++ *     // 2. PAS_MEM_SETUP: fn 0x02000202, arginfo 0x3, (id, phys, len)
++ *     ret = sweet_scm_smc(SCM_SIP_FNID(SCM_SVC_PIL, SCM_PAS_MEM_SETUP)
++ *         | SMC64_MASK, SCM_ARGS3, SCM_PAS_ID_GPU_ZAP,
++ *         (uint64_t)region, (uint64_t)region_len, 0, &r);
++ *     if (ret != 0 || r.r1 != 0) return -1;
++ *
++ *     // 3. PAS_AUTH_AND_RESET: fn 0x02000205, arginfo 0x1, (id)
++ *     //    This is the call that should drop the GPU out of secure mode:
++ *     //    after it, RBBM_SECVID_TRUST_CNTL / the SECVID window at
++ *     //    0x0503c000 should stop hanging the bus.
++ *     ret = sweet_scm_smc(SCM_SIP_FNID(SCM_SVC_PIL,
++ *         SCM_PAS_AUTH_AND_RESET) | SMC64_MASK, SCM_ARGS1,
++ *         SCM_PAS_ID_GPU_ZAP, 0, 0, 0, &r);
++ *     return (ret == 0 && r.r1 == 0) ? 0 : -1;
++ *
++ *     // 4. Error path / unload: PAS_SHUTDOWN, fn 0x02000206, arginfo 0x1.
++ * }
++ * #endif
++ *
++ * Unknowns before that can be written for real:
++ *   - Where the zap image actually lives on this phone: the vendor splits it
++ *     into a540_zap.mdt + a540_zap.b00..bNN under /etc/firmware (the
++ *     "firmware" partition / system vendor image).  XNU would have to read
++ *     it from the UFS partition itself, and the .mdt header parser
++ *     (peripheral-loader.c:75-200) is not implemented here.
++ *   - The TZ's idea of the image: does PAS_INIT_IMAGE want the raw .mdt +
++ *     hash segment, or a flattened image?  The vendor hands it exactly the
++ *     buffer pil_get() built from the .mdt/.bNN files, so a byte-identical
++ *     reconstruction is the only safe assumption.
++ *   - Physical contiguity and cache state of that buffer (above).  The
++ *     monitor reads it with its own MMU off/on; a fragmented or dirty
++ *     buffer is the most likely way to get an opaque "invalid address" back
++ *     from SCM (SCM_EINVAL_ADDR = -3).
++ *   - Whether the monitor accepts a PAS id 13 load from a non-Android boot
++ *     chain at all: PAS often keys off the "dload" cookie / the APPS image
++ *     authentication state established by the vendor's XBL/TZ boot flow.
++ *     If it refuses, r0/r1 still tells us which (transport vs PAS verdict),
++ *     and nothing is lost.
++ *   - Which SMC convention this monitor really wants is answered by stage 1,
++ *     not assumed: if the log says smc32, all of the above uses mask 0.
++ * ---------------------------------------------------------------------------
++ */
++
++#else /* !ARM64_BOARD_CONFIG_SAGIT */
++
++/*
++ * SCM on this port is MSM8998-specific only in its PAS ids; the ABI itself
++ * is generic SMC.  Nothing else in the tree calls this, and other boards
++ * (sweet/SM7150) must not poke the monitor, so the symbol exists and does
++ * nothing.
++ */
++void
++sweet_scm_probe_init(void)
++{
++}
++
++#endif /* ARM64_BOARD_CONFIG_SAGIT */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 05e9a4a..82df10d 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -50,6 +50,9 @@ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
++/* MSM8998 (sagit) SCM probe: stage 1 of the TZ/PIL zap path, off unless
++ * sweetscmprobe=1. */
++extern void sweet_scm_probe_init(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ /* MSM8998 (sagit) power key, off unless sweetpowerkey=1 / sweetkeepawake=N */
+@@ -660,6 +663,9 @@ sweet_ufs_init(void)
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
++	/* SCM probe (sagit): starts a thread and does nothing unless
++	 * sweetscmprobe=1. */
++	sweet_scm_probe_init();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
