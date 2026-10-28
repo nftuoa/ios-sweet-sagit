@@ -1,0 +1,159 @@
+--- a/bsd/dev/sweet_gpuprobe.c
++++ b/bsd/dev/sweet_gpuprobe.c
+@@ -127,6 +127,8 @@
+  *  - boot args (default off; a plain boot is unchanged):
+  *      sweetgpuprobe=1          run the probe
+  *      sweetgpuprobedelay=<s>   seconds to wait first (1..120, default 10)
++ *      sweetgpuprobenosecvid=1  skip the SECVID phase (it hung on the first
++ *                               boot: the TZ owns 0x503c000..0x503e040)
+  */
+ #if defined(ARM64_BOARD_CONFIG_SAGIT)
+ 
+@@ -249,6 +251,7 @@
+ 	bool ahb_ok;
+ 	bool alive;
+ 	bool secvid_ok;
++	bool nosecvid;
+ } gp;
+ 
+ static int gp_started;
+@@ -656,51 +659,6 @@
+ 	gp.alive = true;
+ 	printf(GP_PFX "RBBM answers: block is alive\n");
+ 
+-	/* Informational only; never written. */
+-	printf(GP_PFX "RBBM_SECVID_TRUST_CONFIG 0x503c000 = 0x%08x\n",
+-	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TRUST_CFG));
+-	printf(GP_PFX "RBBM_SECVID_TSB_CNTL 0x503e00c = 0x%08x\n",
+-	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TSB_CNTL));
+-	printf(GP_PFX "RBBM_SECVID_TSB trusted base/size 0x503e000..8 = "
+-	    "0x%08x 0x%08x 0x%08x, ADDR_MODE_CNTL 0x503e040 = 0x%08x\n",
+-	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TSB_BASE_LO),
+-	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TSB_BASE_HI),
+-	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TSB_SIZE),
+-	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TSB_ADDR_MODE));
+-
+-	before = gp_rd(gp.kgsl, GP_RBBM_SECVID_TRUST_CNTL);
+-	printf(GP_PFX "RBBM_SECVID_TRUST_CNTL 0x503d000 = 0x%08x before the "
+-	    "write\n", before);
+-
+-	/*
+-	 * The decisive store.  Print the intent first: if the TZ owns this
+-	 * register the access may take a bus error / SError and the line
+-	 * above is the last thing in the ring.  Mainline does exactly this
+-	 * when it has no zap shader (a5xx_gpu.c:1003) and warns that a
+-	 * permissions violation follows if the guess was wrong.
+-	 */
+-	printf(GP_PFX "writing RBBM_SECVID_TRUST_CNTL = 0 (leave secure mode "
+-	    "the mainline way, without a zap shader)\n");
+-	gp_wr_raw(gp.kgsl, GP_RBBM_SECVID_TRUST_CNTL, 0x00000000u);
+-
+-	rb = gp_rd(gp.kgsl, GP_RBBM_SECVID_TRUST_CNTL);
+-	delay(1);
+-	rb2 = gp_rd(gp.kgsl, GP_RBBM_SECVID_TRUST_CNTL);
+-	delay(1);
+-	rb3 = gp_rd(gp.kgsl, GP_RBBM_SECVID_TRUST_CNTL);
+-	printf(GP_PFX "RBBM_SECVID_TRUST_CNTL after the write: 0x%08x "
+-	    "0x%08x 0x%08x\n", rb, rb2, rb3);
+-
+-	if (rb == 0 && rb2 == 0 && rb3 == 0) {
+-		gp.secvid_ok = true;
+-		printf(GP_PFX "SECVID write STUCK at 0: the GPU can be taken "
+-		    "out of secure mode without a zap shader\n");
+-	} else {
+-		gp.secvid_ok = false;
+-		printf(GP_PFX "SECVID write was BLOCKED (reads back 0x%08x): "
+-		    "the TZ/hypervisor owns secure mode, the zap shader / SMC "
+-		    "path is mandatory\n", rb);
+-	}
+ }
+ 
+ /* ------------------------------------------------------------------ */
+@@ -747,6 +705,62 @@
+ }
+ 
+ /* ------------------------------------------------------------------ */
++/* Phase 6: the SECVID region (TrustZone-owned; may stall the bus)     */
++/* ------------------------------------------------------------------ */
++/*
++ * The first boot showed the probe stopping right after "RBBM answers":
++ * reading RBBM_SECVID_TRUST_CONFIG at 0x503c000 already hung, which is the
++ * signature of the TZ owning the whole SECVID window.  The SMMU dump now runs
++ * before this phase so that data is never lost, and this phase can be skipped
++ * entirely with sweetgpuprobenosecvid=1.
++ */
++static void
++gp_secvid(void)
++{
++	uint32_t before, rb, rb2, rb3;
++
++	printf(GP_PFX "SECVID phase: touching 0x503c000 first (the previous "
++	    "boot hung here)\n");
++	printf(GP_PFX "RBBM_SECVID_TRUST_CONFIG 0x503c000 = 0x%08x\n",
++	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TRUST_CFG));
++	printf(GP_PFX "RBBM_SECVID_TSB_CNTL 0x503e00c = 0x%08x\n",
++	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TSB_CNTL));
++	printf(GP_PFX "RBBM_SECVID_TSB trusted base/size 0x503e000..8 = "
++	    "0x%08x 0x%08x 0x%08x, ADDR_MODE_CNTL 0x503e040 = 0x%08x\n",
++	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TSB_BASE_LO),
++	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TSB_BASE_HI),
++	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TSB_SIZE),
++	    gp_rd(gp.kgsl, GP_RBBM_SECVID_TSB_ADDR_MODE));
++
++	before = gp_rd(gp.kgsl, GP_RBBM_SECVID_TRUST_CNTL);
++	printf(GP_PFX "RBBM_SECVID_TRUST_CNTL 0x503d000 = 0x%08x before the "
++	    "write\n", before);
++
++	printf(GP_PFX "writing RBBM_SECVID_TRUST_CNTL = 0 (leave secure mode "
++	    "the mainline way, without a zap shader)\n");
++	gp_wr_raw(gp.kgsl, GP_RBBM_SECVID_TRUST_CNTL, 0x00000000u);
++
++	rb = gp_rd(gp.kgsl, GP_RBBM_SECVID_TRUST_CNTL);
++	delay(1);
++	rb2 = gp_rd(gp.kgsl, GP_RBBM_SECVID_TRUST_CNTL);
++	delay(1);
++	rb3 = gp_rd(gp.kgsl, GP_RBBM_SECVID_TRUST_CNTL);
++	printf(GP_PFX "RBBM_SECVID_TRUST_CNTL after the write: 0x%08x "
++	    "0x%08x 0x%08x\n", rb, rb2, rb3);
++
++	if (rb == 0 && rb2 == 0 && rb3 == 0) {
++		gp.secvid_ok = true;
++		printf(GP_PFX "SECVID write STUCK at 0: the GPU can be taken "
++		    "out of secure mode without a zap shader\n");
++	} else {
++		gp.secvid_ok = false;
++		printf(GP_PFX "SECVID write was BLOCKED (reads back 0x%08x): "
++		    "the TZ/hypervisor owns secure mode, the zap shader / SMC "
++		    "path is mandatory\n", rb);
++	}
++}
++
++/* ------------------------------------------------------------------ */
+ /* One-line verdict for the decision table in the doc                  */
+ /* ------------------------------------------------------------------ */
+ static void
+@@ -821,6 +835,11 @@
+ 
+ 	gp_rbbm();
+ 	gp_smmu();
++	if (gp.nosecvid) {
++		printf(GP_PFX "SECVID phase skipped (sweetgpuprobenosecvid=1)\n");
++	} else {
++		gp_secvid();
++	}
+ 
+ 	gp_verdict();
+ 	printf(GP_PFX "--- probe end ---\n");
+@@ -863,6 +882,12 @@
+ 	(void)PE_parse_boot_argn("sweetgpuprobe", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweetgpuprobedelay", &delay_s,
+ 	    sizeof(delay_s));
++	{
++		int nosec = 0;
++		(void)PE_parse_boot_argn("sweetgpuprobenosecvid", &nosec,
++		    sizeof(nosec));
++		gp.nosecvid = nosec != 0;
++	}
+ 
+ 	if (!enabled) {
+ 		printf(GP_PFX "disabled (sweetgpuprobe=0)\n");
