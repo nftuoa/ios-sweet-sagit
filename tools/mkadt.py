@@ -224,7 +224,10 @@ def build(seed=None, qemu=False, highmem=False, machine='sweet'):
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),
-            ('compatible', cstr(machine + ',display')),
+            # 'sweet,display' is what the kext personality matches
+            # (iokit/KernelConfigTables.cpp); keep the board name first so the
+            # device tree still identifies the actual machine.
+            ('compatible', cstr(machine + ',display') + cstr('sweet,display')),
             ('canvas-width', u32(m['canvas_w'])),
             ('canvas-height', u32(m['canvas_h'])),
         ])])
