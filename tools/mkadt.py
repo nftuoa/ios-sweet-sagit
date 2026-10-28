@@ -63,11 +63,18 @@ MACHINES = {
         # the upper bank (0x1_00000000 + 0x7e4c0000) is clean.
         phys_base=0xb0000000, mem_size=0x46000000,
         high_phys_base=0x100000000, high_mem_size=0x7e4c0000,
-        # 0138: scratch for the a540 zap image, which PAS must see below 4 GiB.
+        # 0138: scratch for the a540 zap buffers, which PAS must see below 4 GiB.
         # 0x98000000 is in the stock DTB's only large fixed-free hole in the
         # low bank, 0x95700000..0x9d400000: 41 MiB above pil_ipa_gpu and 84 MiB
         # below the framebuffer at 0x9d400000.  See mi6/docs/4k/zap-load.md.
-        zap_region=(0x98000000, 0x10000),
+        #
+        # 0139: 2 MiB, not 64 KiB.  PAS takes two buffers (init_image gets the
+        # .mdt metadata, mem_setup gets the segment region), and the segment
+        # region has to sit on the 0x100000 p_align of the image's only
+        # loadable program header, so sweet_scm.c puts it 1 MiB into this
+        # range: metadata at +0x000000 (6684 B), segments at +0x100000
+        # (0x2000 B), 16 KiB page mapped for each.
+        zap_region=(0x98000000, 0x200000),
     ),
 }
 
