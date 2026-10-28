@@ -63,6 +63,11 @@ MACHINES = {
         # the upper bank (0x1_00000000 + 0x7e4c0000) is clean.
         phys_base=0xb0000000, mem_size=0x46000000,
         high_phys_base=0x100000000, high_mem_size=0x7e4c0000,
+        # 0138: scratch for the a540 zap image, which PAS must see below 4 GiB.
+        # 0x98000000 is in the stock DTB's only large fixed-free hole in the
+        # low bank, 0x95700000..0x9d400000: 41 MiB above pil_ipa_gpu and 84 MiB
+        # below the framebuffer at 0x9d400000.  See mi6/docs/4k/zap-load.md.
+        zap_region=(0x98000000, 0x10000),
     ),
 }
 
@@ -112,7 +117,7 @@ def build(seed=None, qemu=False, highmem=False, machine='sweet'):
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
 
-    chosen = node('chosen', [
+    chosen_props = [
         ph(),
         ('dram-base', u64(phys_base)),
         ('dram-size', u64(mem_size)),
@@ -147,7 +152,16 @@ def build(seed=None, qemu=False, highmem=False, machine='sweet'):
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
-    ], [node('memory-map', [ph()]),
+    ]
+    # 0138: publish the low PAS buffer to the kernel.  XNU's arm platform
+    # expert never looks at reserved-memory (it only reads /chosen and
+    # /chosen/memory-map), so a reserved-memory node would be dead weight
+    # here; sweet_scm.c reads this property instead.  Emitted for sagit only,
+    # so sweet/QEMU ADTs are unchanged.
+    if 'zap_region' in m:
+        chosen_props.append(('sweet-zap-region', u64(*m['zap_region'])))
+
+    chosen = node('chosen', chosen_props, [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
         # debugger, dtrace, nvram), lp-sip1: unauthenticated (unsealed) root.
