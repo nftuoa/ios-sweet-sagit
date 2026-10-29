@@ -1,0 +1,1346 @@
+diff --git a/bsd/dev/sweet_gpu_cp.c b/bsd/dev/sweet_gpu_cp.c
+index fff5e26..7aa0a80 100644
+--- a/bsd/dev/sweet_gpu_cp.c
++++ b/bsd/dev/sweet_gpu_cp.c
+@@ -34,9 +34,29 @@
+  *   sweetcpfull=1      sweetcpfull=1, so a stray sweetcp=1 cannot wedge a
+  *                      boot again.
+  *
++ * 0143 adds the stage the 0142 wedge pointed at: the GPU's SMMU.  The CP
++ * fetches microcode, ring and IB with *GPU* (IOVA) addresses, so those
++ * fetches go through the arm-smmu-v2 at 0x05040000.  If the GPU's stream IDs
++ * translate there -- and nothing in the vendor DT or this kernel says they
++ * are bypassed -- then the physical addresses 0141 programs fault, and the
++ * first fetch is where a fault becomes a stalled engine:
++ *
++ *   sweetsmmuprobe=1    read-only dump of the SMMU: sCR0/sCR2/sGFSR, the ID
++ *                       registers, every implemented SMR/S2CR (decoded into
++ *                       STYPE/CBNDX), and every register of every implemented
++ *                       context bank.  One canary line before each read, no
++ *                       write at all.
++ *   sweetsmmumap=1      the same dump, and then -- only if SID 0 is *not*
++ *                       already bypassed -- a 4 KiB stage-1 table set that
++ *                       identity-maps the CP window (VA == PA, so the CP's
++ *                       0x9804xxxx addresses stay valid) and a CB0/SMR0/S2CR0
++ *                       programming for SID 0.  It writes no CP register, so
++ *                       the ME stays halted: the mapping is verified from the
++ *                       SMMU side and a later boot starts the engine.
++ *
+  * A plain boot runs nothing.  Non-fatal: every failure is one line and the
+  * boot continues -- unless the MMIO access itself wedges the interconnect,
+- * which is exactly the failure the two new modes are meant to localise.
++ * which is exactly the failure these modes are meant to localise.
+  *
+  * ---------------------------------------------------------------------------
+  * What is proven and where it was read
+@@ -140,9 +160,24 @@
+  *                           (default 20 s) in the same boot: without it the
+  *                           GPU is still secure and the CP cannot fetch
+  *                           non-secure microcode.
++ *   sweetsmmuprobe=1        read-only SMMU dump; nothing is written
++ *   sweetsmmumap=1          SMMU dump + a stage-1 identity map for SID 0;
++ *                           writes only SMMU registers and DRAM tables, never
++ *                           the CP, so the ME is not started
++ *   sweetsmmudelay=<s>      seconds before either SMMU mode, 1..180,
++ *                           default 30 (the SMMU state is only the post-zap
++ *                           state once the zap has run)
++ *   sweetsmmuforce=1        map even when the probe says SID 0 is bypass
++ *                           (proves the write path without needing it)
++ *   sweetsmmuatos=1         after programming, translate one address through
++ *                           the SMMU itself (ATS1PR, with the qcom micro-MMU
++ *                           halt/resume); the strongest check that the tables
++ *                           are right, but the riskiest register access, so
++ *                           it is a second opt-in
+  *
+- * Priority if several are set: probe (read-only) wins over bisect, which
+- * wins over the full path; the ignored arguments are named in the log.
++ * Priority if several are set: sweep the SMMU modes first (map beats probe),
++ * then the CP probe, the bisect and the full path; the ignored arguments are
++ * named in the log.
+  *
+  * Report, log lines and failure signatures: mi6/docs/4k/cp-ringbuffer.md.
+  * ---------------------------------------------------------------------------
+@@ -372,12 +407,15 @@ static struct {
+ 	int		probe_secvid;
+ } scp;
+ 
+-/* One mode per boot: 0142 selects exactly one of the three experiments. */
++/* One mode per boot: 0142 selects one of three CP experiments, 0143 adds
++ * the two SMMU ones. */
+ enum {
+ 	SCP_MODE_OFF = 0,
+ 	SCP_MODE_PROBE,
+ 	SCP_MODE_BISECT,
+ 	SCP_MODE_FULL,
++	SCP_MODE_SMMU_PROBE,
++	SCP_MODE_SMMU_MAP,
+ };
+ 
+ #define SCP_BISECT_MAX	17
+@@ -897,22 +935,30 @@ scp_build(void)
+ static void
+ scp_smmu_peek(void)
+ {
+-	static const char *stype[4] = { "abort", "bypass", "stage1", "stage2" };
++	/* STYPE is bits 17:16 and 0 means *translation* (arm-smmu.c:174-176);
++	 * 0142 read bits 1:0 here, which is CBNDX[1:0], and called bit 1 of
++	 * sCR0 "SMMUEN" when it is GFRE.  Both fixed in 0143. */
++	static const char *stype[4] = {
++		"translation", "bypass", "fault", "reserved"
++	};
+ 	uint32_t scr0 = scp_rd(scp.smmu, CP_SMMU_sCR0);
+ 	uint32_t s2[4];
++	unsigned t[4];
+ 	unsigned i;
+ 
+ 	for (i = 0; i < 4; ++i) {
+ 		s2[i] = scp_rd(scp.smmu, CP_SMMU_S2CR(i));
+-	}
+-	printf(CP_PFX "SMMU (read-only): sCR0 0x%08x SMMUEN=%u CLIENTPD=%u; "
+-	    "S2CR0..3 %08x %08x %08x %08x (STYPE %s/%s/%s/%s)\n", scr0,
+-	    (scr0 >> 1) & 1u, scr0 & 1u, s2[0], s2[1], s2[2], s2[3],
+-	    stype[s2[0] & 3u], stype[s2[1] & 3u], stype[s2[2] & 3u],
+-	    stype[s2[3] & 3u]);
+-	printf(CP_PFX "SMMU: this stage programs nothing.  If SMMUEN=1 and the "
+-	    "GPU's stream IDs are not bypass, the CP's physical addresses are "
+-	    "translated and the microcode fetch faults\n");
++		t[i] = (s2[i] >> 16) & 3u;
++	}
++	printf(CP_PFX "SMMU (read-only): sCR0 0x%08x CLIENTPD=%u GFRE=%u; "
++	    "S2CR0..3 %08x %08x %08x %08x (STYPE %s/%s/%s/%s, CBNDX "
++	    "%u/%u/%u/%u)\n", scr0, scr0 & 1u, (scr0 >> 1) & 1u, s2[0], s2[1],
++	    s2[2], s2[3], stype[t[0]], stype[t[1]], stype[t[2]], stype[t[3]],
++	    s2[0] & 0xffu, s2[1] & 0xffu, s2[2] & 0xffu, s2[3] & 0xffu);
++	printf(CP_PFX "SMMU: this path programs no SMMU register.  If SID 0 is "
++	    "not bypass, the CP's physical addresses are translated and the "
++	    "microcode fetch faults; sweetsmmuprobe=1 / sweetsmmumap=1 (0143) "
++	    "are the modes that measure and fix that\n");
+ }
+ 
+ /* ------------------------------------------------------------------ */
+@@ -1571,6 +1617,1112 @@ scp_bisect_run(int idx)
+ 	 * another chance to wedge, and one boot answers one question. */
+ }
+ 
++/* ==================================================================== */
++/* 0143: the GPU's SMMU (arm-smmu-v2 at 0x05040000)                     */
++/*                                                                      */
++/* Why this stage exists: the CP does not fetch from physical addresses. */
++/* kgsl's a5xx_microcode_load() and mainline's a5xx_hw_init() both write */
++/* CP_PFP_INSTR_BASE / CP_PM4_INSTR_BASE with the *GPU* address of the   */
++/* microcode buffers (a5xx_gpu.c: `gpu_write64(..., a5xx_gpu->pfp_iova)`) */
++/* and CP_RB_BASE with the ring's GPU address, so every CP fetch is a    */
++/* translated access through this SMMU's context for the GPU's stream    */
++/* ID.  0141 programmed physical addresses; that is only correct if that */
++/* stream ID is bypassed.                                               */
++/*                                                                      */
++/* What the vendor tree, the stock DTB and mainline prove (not guessed): */
++/*                                                                      */
++/*  - The node is `arm,smmu-kgsl@5040000`, compatible "qcom,smmu-v2",    */
++/*    #iommu-cells = <1>, with qcom,skip-init, qcom,register-save and    */
++/*    qcom,dynamic (arch/arm/boot/dts/qcom/msm-arm-smmu-8998.dtsi:145;   */
++/*    the stock sagit DTB has the same properties).  qcom,skip-init      */
++/*    means the vendor driver never resets SMR/S2CR/CB state, so         */
++/*    whatever LK/TZ left behind is what the GPU runs with: it has to be */
++/*    measured.                                                         */
++/*  - The GPU's contexts are gfx3d_user `iommus = <&kgsl_smmu 0>` with   */
++/*    `qcom,gpu-offset = <0x48000>`, and gfx3d_secure                    */
++/*    `iommus = <&kgsl_smmu 2>` (msm8998-gpu.dtsi:248-275).  The stock   */
++/*    sagit DTB (dtc -I dtb -O dts) has exactly the same two cells for   */
++/*    that SMMU -- <0x1ab 0x00> and <0x1ab 0x02> -- and no other node    */
++/*    refers to phandle 0x1ab.  The GPU therefore uses exactly SID 0     */
++/*    (non-secure/user) and SID 2 (secure).  There is no 0x400/0x401 SID */
++/*    for the GPU anywhere in the vendor tree or the DTB; the            */
++/*    `qcom,smmu-sid-base = <0x1480>` in that DTB belongs to a different */
++/*    device (the anoc1 SMMU's iommu-map).                              */
++/*  - qcom,gpu-offset = 0x48000 is the offset of context bank 0 inside   */
++/*    the kgsl register window: 0x05000000 + 0x48000 = 0x05048000 =      */
++/*    SMMU + 0x8000.  That is where the GPU writes its own TTBR0, i.e.   */
++/*    SID 0 is hard-wired to CB0.  kgsl_iommu.h agrees                   */
++/*    (KGSL_IOMMU_CB0_OFFSET 0x8000, KGSL_IOMMU_CB_SHIFT 12) and         */
++/*    mainline states the rule outright: arm-smmu-qcom.c `#define        */
++/*    QCOM_ADRENO_SMMU_GPU_SID 0` -- "The GPU will always use SID 0",    */
++/*    and qcom_adreno_smmu_alloc_context_bank() pins the GPU to CB0 "so  */
++/*    the GPU hardware can switch pagetables".                          */
++/*  - Neither SID is in bypass by DT: the kgsl SMMU node has no          */
++/*    `qcom,smmu-s1-bypass`.  That property appears in this tree only on */
++/*    the *IPA* SMMU nodes, and this vendor arm-smmu.c has no handler    */
++/*    for it at all (no s1_bypass symbol exists in the file; the option  */
++/*    table at arm-smmu.c:475 lists only calxeda,smmu-secure-config-     */
++/*    access, qcom,register-save, qcom,skip-init, qcom,dynamic, ...).    */
++/*    The vendor runs the GPU *translated*: kgsl attaches both contexts  */
++/*    and arm_smmu_domain_add_master() writes S2CR = STYPE|CBNDX.  But   */
++/*    that attach never happens on this port, so what the boot chain     */
++/*    left is exactly the open question the probe answers.              */
++/*  - Register layout (arm-smmu.c / arm-smmu.h): GR0 is page 0 (SMR       */
++/*    0x800+4n, S2CR 0xc00+4n, ID0 0x20, ID1 0x24, ID2 0x28, ID5 0x34,   */
++/*    sGFSR 0x48, sGFSYNR0/1 0x50/0x54, sCR0 0x0, sCR2 0x4, sTLBGSYNC    */
++/*    0x70, sTLBGSTATUS 0x74); GR1 is page (1 << pgshift) (CBAR +0x000,  */
++/*    CBFRSYNRA +0x400, CBA2R +0x800, each +4n); the context banks start */
++/*    at reg_size/2 with one page each (ARM_SMMU_CB_BASE() = base +      */
++/*    size/2, ARM_SMMU_CB(n) = n << pgshift).  IDR1.PAGESIZE = 0 in      */
++/*    0x20008003, so pgshift = 12 and GR1 = +0x1000, CB0 = +0x8000,      */
++/*    CB n = +0x8000 + n*0x1000 -- exactly the qcom,gpu-offset above.    */
++/*  - CB register offsets: SCTLR 0x0, ACTLR 0x4, RESUME 0x8, TTBCR2      */
++/*    0x10, TTBR0 0x20, TTBR1 0x28, TTBCR 0x30, CONTEXTIDR 0x34,         */
++/*    S1_MAIR0 0x38, S1_MAIR1 0x3c, PAR 0x50/0x54, FSR 0x58, FAR         */
++/*    0x60/0x64, FSYNR0 0x68, FSYNR1 0x6c, S1_TLBIASID 0x610, TLBSYNC    */
++/*    0x7f0, TLBSTATUS 0x7f4, ATS1PR 0x800, ATSR 0x8f0.                 */
++/*    kgsl_iommu.c's own reg_list agrees for SCTLR/TTBR0/FSR/FAR/        */
++/*    TLBIALL/FSYNR0.                                                   */
++/*  - What a working stage-1 context looks like, register for register,  */
++/*    is arm_smmu_init_context_bank() + arm_smmu_master_configure_smrs() */
++/*    + arm_smmu_domain_add_master(): CBA2R = 1 (64-bit) *before* CBAR   */
++/*    (VMID16), CBAR = type<<16 | MEMATTR<<12 | BPSHCFG<<8 | VMID,       */
++/*    TTBR0 = table | ASID<<48, TTBCR/TTBCR2 from io-pgtable-arm, the    */
++/*    MAIRs, then SCTLR = M|CFIE|CFRE|AFE|TRE|S1_ASIDPNE, then           */
++/*    SMR = VALID|ID|MASK, then S2CR = TYPE|CBNDX.  qcom's adreno hook   */
++/*    (arm-smmu-qcom.c qcom_adreno_smmu_write_sctlr()) clears CFCFG and   */
++/*    sets HUPCF "to keep the GPU from hanging" on a fault -- copied     */
++/*    here, because stall-on-fault would look exactly like the 0141      */
++/*    wedge.                                                            */
++/*  - TTBCR/TTBCR2/MAIR/PTE shapes: io-pgtable-arm.c                     */
++/*    arm_64_lpae_alloc_pgtable_s1() (T0SZ = 64 - IAS, TG0 = 0 for 4 KiB,*/
++/*    IRGN0/ORGN0 = WBWA when the tables are coherent else NC, SH0 = OS; */
++/*    MAIR0 = NC at index 0, WB-RWA at index 1, device at index 2) and   */
++/*    arm_smmu_lpae_tcr2() (IPS in bits 3:0, SEP = 7 in bits 17:15).     */
++/*                                                                      */
++/* Inferred, not proven:                                                */
++/*  - that the state the probe reads is the post-zap state.  The zap's   */
++/*    auth_and_reset may reprogram the SMMU, so a probe meant to explain */
++/*    the ME start must run after the zap in the same boot.             */
++/*  - that the GPU's non-secure traffic carries SID 0.  The DT proves    */
++/*    which SID the *driver* attaches to which context; that the CP's    */
++/*    fetch carries that SID is hardware (mainline's "GPU always uses    */
++/*    SID 0" is about identifying the GPU, not about the CP's AXI        */
++/*    attribute).                                                       */
++/*  - that reading SMR3/S2CR3/CB3 is safe when IDR0.NUMSMRG / IDR1.NUMCB */
++/*    read 3.  The architecture defines both fields as "count - 1" (so 4 */
++/*    of each, indices 0..3); the vendor driver uses the raw field as    */
++/*    the count.  Both readings include 0, which is all the mapping mode */
++/*    needs; banks past NUMCB are never touched.                        */
++/* ==================================================================== */
++
++#define SSP_PFX			"SWEET SMMU: "
++
++/* The GPU's stream IDs (stock DTB + vendor dtsi + mainline, see above). */
++#define SSP_SID_USER		0u	/* gfx3d_user, qcom,gpu-offset 0x48000 */
++#define SSP_SID_SECURE		2u	/* gfx3d_secure                        */
++
++/* GR0 (page 0). */
++#define SSP_sCR0		0x000u
++#define SSP_sCR2		0x004u
++#define SSP_ID0			0x020u
++#define SSP_ID1			0x024u
++#define SSP_ID2			0x028u
++#define SSP_ID5			0x034u
++#define SSP_sGFSR		0x048u
++#define SSP_sGFSYNR0		0x050u
++#define SSP_sGFSYNR1		0x054u
++#define SSP_sTLBGSYNC		0x070u
++#define SSP_sTLBGSTATUS		0x074u
++#define SSP_SMR(n)		(0x800u + 4u * (n))
++#define SSP_S2CR(n)		(0xc00u + 4u * (n))
++
++/* GR1 (page 1 << pgshift), one 4-byte register per stream/context. */
++#define SSP_GR1_CBAR(n)		(0x000u + 4u * (n))
++#define SSP_GR1_CBFRSYNRA(n)	(0x400u + 4u * (n))
++#define SSP_GR1_CBA2R(n)	(0x800u + 4u * (n))
++
++/* Context-bank page. */
++#define SSP_CB_SCTLR		0x000u
++#define SSP_CB_ACTLR		0x004u
++#define SSP_CB_RESUME		0x008u
++#define SSP_CB_TTBCR2		0x010u
++#define SSP_CB_TTBR0		0x020u
++#define SSP_CB_TTBR1		0x028u
++#define SSP_CB_TTBCR		0x030u
++#define SSP_CB_CONTEXTIDR	0x034u
++#define SSP_CB_S1_MAIR0		0x038u
++#define SSP_CB_S1_MAIR1		0x03cu
++#define SSP_CB_PAR_LO		0x050u
++#define SSP_CB_PAR_HI		0x054u
++#define SSP_CB_FSR		0x058u
++#define SSP_CB_FAR_LO		0x060u
++#define SSP_CB_FAR_HI		0x064u
++#define SSP_CB_FSYNR0		0x068u
++#define SSP_CB_FSYNR1		0x06cu
++#define SSP_CB_S1_TLBIASID	0x610u
++#define SSP_CB_TLBSYNC		0x7f0u
++#define SSP_CB_TLBSTATUS	0x7f4u
++#define SSP_CB_ATS1PR		0x800u
++#define SSP_CB_ATSR		0x8f0u
++
++/* Implementation-defined page 1 (stock DTB qcom,micro-mmu-control = 0x6000;
++ * arm-smmu.c ARM_SMMU_IMPL_DEF1() = base + 6 * (1 << pgshift)).  Only the
++ * ATS1PR halt/resume dance uses it. */
++#define SSP_IMPL_DEF1		0x6000u
++#define SSP_MICRO_MMU_CTRL	0x000u
++#define SSP_MICRO_HALT_REQ	(1u << 2)
++#define SSP_MICRO_IDLE		(1u << 3)
++
++/* sCR0 fields, arm-smmu.c:56-68.  There is no SMMUEN bit: bit 0 is CLIENTPD
++ * (0 = clients may access) and bit 1 is GFRE. */
++#define SSP_CR0_CLIENTPD	(1u << 0)
++#define SSP_CR0_GFRE		(1u << 1)
++#define SSP_CR0_GFIE		(1u << 2)
++#define SSP_CR0_GCFGFRE		(1u << 4)
++#define SSP_CR0_GCFGFIE		(1u << 5)
++#define SSP_CR0_USFCFG		(1u << 10)
++#define SSP_CR0_VMIDPNE		(1u << 11)
++#define SSP_CR0_PTM		(1u << 12)
++#define SSP_CR0_FB		(1u << 13)
++
++/* IDR0, arm-smmu.c:107-120. */
++#define SSP_ID0_S1TS		(1u << 30)
++#define SSP_ID0_S2TS		(1u << 29)
++#define SSP_ID0_NTS		(1u << 28)
++#define SSP_ID0_SMS		(1u << 27)
++#define SSP_ID0_ATOSNS		(1u << 26)
++#define SSP_ID0_NUMIRPT(d)	(((d) >> 16) & 0xffu)
++#define SSP_ID0_NUMSIDB(d)	(((d) >> 9) & 0xfu)
++#define SSP_ID0_NUMSMRG(d)	((d) & 0xffu)
++
++/* IDR1 / IDR2, arm-smmu.c:122-155. */
++#define SSP_ID1_PAGESIZE	(1u << 31)
++#define SSP_ID1_NUMPAGENDXB(d)	(((d) >> 28) & 7u)
++#define SSP_ID1_NUMS2CB(d)	(((d) >> 16) & 0xffu)
++#define SSP_ID1_NUMCB(d)	((d) & 0xffu)
++#define SSP_ID2_IAS(d)		((d) & 0xfu)
++#define SSP_ID2_OAS(d)		(((d) >> 4) & 0xfu)
++#define SSP_ID2_UBS(d)		(((d) >> 8) & 0xfu)
++#define SSP_ID2_PTFS_4K		(1u << 12)
++#define SSP_ID2_PTFS_16K	(1u << 13)
++#define SSP_ID2_PTFS_64K	(1u << 14)
++
++/* SMR / S2CR / CBAR / SCTLR fields, arm-smmu.c:160-250. */
++#define SSP_SMR_VALID		(1u << 31)
++#define SSP_SMR_ID(d)		((d) & 0xffffu)
++#define SSP_SMR_MASK(d)		(((d) >> 16) & 0xffffu)
++#define SSP_S2CR_CBNDX(d)	((d) & 0xffu)
++#define SSP_S2CR_EXIDVALID	(1u << 10)
++#define SSP_S2CR_TYPE(d)	(((d) >> 16) & 3u)
++#define SSP_S2CR_PRIVCFG(d)	(((d) >> 24) & 3u)
++#define SSP_S2CR_TYPE_TRANS	0u
++#define SSP_S2CR_TYPE_BYPASS	1u
++#define SSP_S2CR_TYPE_FAULT	2u
++#define SSP_CBAR_VMID(d)	((d) & 0xffu)
++#define SSP_CBAR_BPSHCFG(d)	(((d) >> 8) & 3u)
++#define SSP_CBAR_MEMATTR(d)	(((d) >> 12) & 0xfu)
++#define SSP_CBAR_TYPE(d)	(((d) >> 16) & 3u)
++#define SSP_SCTLR_M		(1u << 0)
++#define SSP_SCTLR_TRE		(1u << 1)
++#define SSP_SCTLR_AFE		(1u << 2)
++#define SSP_SCTLR_CFRE		(1u << 5)
++#define SSP_SCTLR_CFIE		(1u << 6)
++#define SSP_SCTLR_CFCFG		(1u << 7)
++#define SSP_SCTLR_HUPCF		(1u << 8)
++#define SSP_SCTLR_S1_ASIDPNE	(1u << 12)
++#define SSP_TLBSTATUS_ACTIVE	(1u << 0)
++
++/* gFSR / FSR / PAR fault bits, arm-smmu.c:257-266. */
++#define SSP_FSR_MULTI		(1u << 31)
++#define SSP_FSR_SS		(1u << 30)
++#define SSP_FSR_UUT		(1u << 8)
++#define SSP_FSR_ASF		(1u << 7)
++#define SSP_FSR_TLBLKF		(1u << 6)
++#define SSP_FSR_TLBMCF		(1u << 5)
++#define SSP_FSR_EF		(1u << 4)
++#define SSP_FSR_PF		(1u << 3)
++#define SSP_FSR_AFF		(1u << 2)
++#define SSP_FSR_TF		(1u << 1)
++#define SSP_PAR_F		(1u << 0)
++#define SSP_ATSR_ACTIVE		(1u << 0)
++
++/* ------------------------------------------------------------------ */
++/* The stage-1 tables: where they live and what goes in them.           */
++/*                                                                     */
++/* The CP window (region + 0x40000 .. +0x80000) already holds pfp/pm4/  */
++/* ring/ib/scratch, so the tables go in the top 64 KiB of it that 0141  */
++/* and 0142 never touch: region + 0x70000.  That needs no mkadt.py      */
++/* change (/chosen/sweet-zap-region is 2 MiB) and no second reserved    */
++/* range.                                                              */
++/* ------------------------------------------------------------------ */
++#define SSP_TBL_IN_WIN		0x30000u	/* = region + 0x70000 */
++#define SSP_TBL_SIZE		0x4000u		/* L1 | L2 | L3 | spare */
++#define SSP_L1_IN_WIN		(SSP_TBL_IN_WIN + 0x0000u)
++#define SSP_L2_IN_WIN		(SSP_TBL_IN_WIN + 0x1000u)
++#define SSP_L3_IN_WIN		(SSP_TBL_IN_WIN + 0x2000u)
++
++/* Identity-mapped VA range == PA range: pfp at +0x40000 through the page
++ * after scratch at +0x65000, i.e. the five buffers named in the log.  The
++ * tables themselves sit above this range and stay unmapped. */
++#define SSP_MAP_FIRST		((uint64_t)CP_LOW_WIN_OFF)		/* 0x40000 */
++#define SSP_MAP_LAST		((uint64_t)CP_SCRATCH_OFF + 0x1000ull)	/* 0x66000 */
++
++/* ARM LPAE long descriptors, stage 1, 4 KiB granule. */
++#define SSP_DESC_TABLE		0x3ull
++#define SSP_DESC_PAGE		0x3ull
++#define SSP_DESC_AF		(1ull << 10)
++#define SSP_DESC_SH_INNER	(3ull << 8)
++#define SSP_DESC_ATTR_IDX(n)	(((uint64_t)(n) & 3ull) << 2)
++#define SSP_DESC_ADDR_MASK	0x0000fffffffff000ull
++#define SSP_ATTR_NC		0u	/* MAIR index 0, 0x44 */
++#define SSP_ATTR_WB		1u	/* MAIR index 1, 0xff (unused here) */
++
++/* Values, each traced to the vendor code quoted above. */
++#define SSP_ASID		1u
++#define SSP_MAIR0_VALUE		0x0004ff44u	/* [0] NC, [1] WB-RWA, [2] dev */
++#define SSP_MAIR1_VALUE		0x00000000u
++#define SSP_CBAR0_VALUE		((1u << 16) | (0xfu << 12) | (3u << 8) | 0u)
++#define SSP_SCTLR0_VALUE	(SSP_SCTLR_M | SSP_SCTLR_TRE | SSP_SCTLR_AFE | \
++				    SSP_SCTLR_CFRE | SSP_SCTLR_CFIE | \
++				    SSP_SCTLR_HUPCF | SSP_SCTLR_S1_ASIDPNE)
++/* T0SZ = 64 - IAS; IDR2.IAS = 36 bits on this SMMU, so T0SZ = 28.  IRGN0 and
++ * ORGN0 = NC (0) because the tables live in the write-combining CP window,
++ * i.e. non-cacheable memory -- io-pgtable-arm picks NC for exactly the same
++ * reason when the device is not dma-coherent.  TG0 = 0 (4 KiB), SH0 = outer
++ * shareable, EPD1 = 1 (TTBR1 walks disabled, which is why TTBR1 is 0). */
++#define SSP_TTBCR0_VALUE	(28u | (0u << 8) | (0u << 10) | (2u << 12) | \
++				    (0u << 14) | (1u << 23))
++#define SSP_TTBCR2_VALUE	(1u | (7u << 15))	/* IPS = 36-bit, SEP */
++
++static struct {
++	vm_offset_t	smmu;		/* SMMU window */
++	unsigned	pgshift;
++	unsigned	gr1_off;	/* 1 << pgshift */
++	unsigned	cb_off;		/* CP_SMMU_SZ / 2 = arm_smmu CB_BASE */
++	unsigned	cb_stride;	/* 1 << pgshift */
++	unsigned	num_smr;
++	unsigned	num_cb;
++	uint32_t	idr0, idr1, idr2, idr5;
++	uint32_t	scr0, sgfsr;
++	uint32_t	smr[8];
++	uint32_t	s2cr[8];
++	unsigned	reads;
++	uint64_t	l1_pa, l2_pa, l3_pa;
++	unsigned	pages;
++	int		force;
++	int		atos;
++	int		programmed;
++} ssp;
++
++/* ------------------------------------------------------------------ */
++/* SMMU MMIO helpers                                                   */
++/* ------------------------------------------------------------------ */
++static uint32_t
++ssp_rd(const char *name, uint32_t off)
++{
++	uint32_t v;
++
++	ssp.reads++;
++	printf(SSP_PFX "probe  %-24s [0x%05x] phys 0x%08x ...\n", name, off,
++	    CP_SMMU_PA + off);
++	__asm__ volatile("dsb sy" ::: "memory");
++	v = scp_rd(ssp.smmu, off);
++	printf(SSP_PFX "  -->  %-24s [0x%05x] = 0x%08x\n", name, off, v);
++	__asm__ volatile("dsb sy" ::: "memory");
++	return v;
++}
++
++/* Canary line before the write, value and read-back after it: a write that
++ * wedges the interconnect leaves its own canary as the last line in the
++ * log, which is what makes one of these safe to try per boot. */
++static uint32_t
++ssp_wr(const char *what, uint32_t off, uint32_t val)
++{
++	uint32_t was = scp_rd(ssp.smmu, off);
++	uint32_t rb;
++
++	printf(SSP_PFX "W %-22s [0x%05x] = 0x%08x ...\n", what, off, val);
++	__asm__ volatile("dsb sy" ::: "memory");
++	scp_wr_raw(ssp.smmu, off, val);
++	__asm__ volatile("dsb sy" ::: "memory");
++	rb = scp_rd(ssp.smmu, off);
++	printf(SSP_PFX "  -->  %-22s [0x%05x] = 0x%08x (was 0x%08x) rb 0x%08x%s\n",
++	    what, off, val, was, rb, rb == val ? "" : "  <-- DID NOT STICK");
++	return rb;
++}
++
++static uint64_t
++ssp_wr64(const char *what, uint32_t off, uint64_t val)
++{
++	volatile uint64_t *p = (volatile uint64_t *)(ssp.smmu + off);
++	uint64_t was = *p, rb;
++
++	printf(SSP_PFX "W %-22s [0x%05x] = 0x%016llx ...\n", what, off,
++	    (unsigned long long)val);
++	__asm__ volatile("dsb sy" ::: "memory");
++	*p = val;
++	__asm__ volatile("dsb sy" ::: "memory");
++	rb = *p;
++	printf(SSP_PFX "  -->  %-22s [0x%05x] = 0x%016llx (was 0x%016llx) rb "
++	    "0x%016llx%s\n", what, off, (unsigned long long)val,
++	    (unsigned long long)was, (unsigned long long)rb,
++	    rb == val ? "" : "  <-- DID NOT STICK");
++	return rb;
++}
++
++/* Poll `mask' in a register for `want', `ms' milliseconds. */
++static int
++ssp_poll(uint32_t off, uint32_t mask, uint32_t want, unsigned ms,
++    const char *what)
++{
++	uint32_t v = 0;
++
++	for (unsigned i = 0; i < ms; ++i) {
++		v = scp_rd(ssp.smmu, off);
++		if ((v & mask) == want) {
++			printf(SSP_PFX "poll %s: 0x%08x after %u ms\n", what, v,
++			    i);
++			return 0;
++		}
++		delay(1000);
++	}
++	printf(SSP_PFX "poll %s: TIMEOUT after %u ms, 0x%08x (mask 0x%08x "
++	    "want 0x%08x)\n", what, ms, v, mask, want);
++	return -1;
++}
++
++static const char *
++ssp_stype_name(uint32_t v)
++{
++	static const char *names[4] = {
++		"translation", "bypass", "fault", "reserved"
++	};
++
++	return names[v & 3u];
++}
++
++static const char *
++ssp_cbar_type_name(uint32_t v)
++{
++	static const char *names[4] = {
++		"stage2-only", "stage1+stage2-bypass", "stage1+stage2-fault",
++		"stage1+stage2-trans"
++	};
++
++	return names[v & 3u];
++}
++
++/* ------------------------------------------------------------------ */
++/* Stream matching: which SMR matches `sid', and what S2CR applies.     */
++/* With IDR0.SMS = 1 the S2CR index is the *SMR* index, not the SID     */
++/* (arm_smmu_master_configure_smrs(), arm_smmu_domain_add_master()).    */
++/* A SID that matches no valid SMR is an unidentified stream, which     */
++/* sCR0.USFCFG turns into a global fault.                               */
++/* ------------------------------------------------------------------ */
++static int
++ssp_sid_match(uint32_t sid, unsigned *smr_idx, uint32_t *s2cr)
++{
++	if (ssp.idr0 & SSP_ID0_SMS) {
++		for (unsigned i = 0; i < ssp.num_smr; ++i) {
++			uint32_t smr = ssp.smr[i];
++
++			if (!(smr & SSP_SMR_VALID)) {
++				continue;
++			}
++			if ((sid ^ SSP_SMR_ID(smr)) & ~SSP_SMR_MASK(smr)) {
++				continue;
++			}
++			*smr_idx = i;
++			*s2cr = ssp.s2cr[i];
++			return 0;
++		}
++		return -1;
++	}
++	/* Stream indexing: S2CR is indexed by the SID itself. */
++	if (sid >= ssp.num_smr) {
++		return -1;
++	}
++	*smr_idx = sid;
++	*s2cr = ssp.s2cr[sid];
++	return 0;
++}
++
++static void
++ssp_report_sid(uint32_t sid, const char *label)
++{
++	unsigned idx = 0;
++	uint32_t s2cr = 0;
++
++	if (ssp_sid_match(sid, &idx, &s2cr) != 0) {
++		printf(SSP_PFX "GPU %s SID %u: matches no SMR -> unidentified "
++		    "stream; sCR0.USFCFG=%u means %s\n", label, sid,
++		    (ssp.scr0 & SSP_CR0_USFCFG) ? 1u : 0u,
++		    (ssp.scr0 & SSP_CR0_USFCFG) ?
++		    "a global fault, so the GPU cannot fetch at all" :
++		    "no global fault is raised (the access still aborts)");
++		return;
++	}
++	printf(SSP_PFX "GPU %s SID %u: SMR%u 0x%08x (ID 0x%x MASK 0x%x) -> "
++	    "S2CR%u 0x%08x STYPE=%u (%s) CBNDX=%u EXIDVALID=%u PRIVCFG=%u\n",
++	    label, sid, idx, ssp.smr[idx], SSP_SMR_ID(ssp.smr[idx]),
++	    SSP_SMR_MASK(ssp.smr[idx]), idx, s2cr, SSP_S2CR_TYPE(s2cr),
++	    ssp_stype_name(SSP_S2CR_TYPE(s2cr)), SSP_S2CR_CBNDX(s2cr),
++	    (s2cr & SSP_S2CR_EXIDVALID) ? 1u : 0u, SSP_S2CR_PRIVCFG(s2cr));
++}
++
++/* ------------------------------------------------------------------ */
++/* Context-bank dump, one block per implemented bank.                  */
++/* ------------------------------------------------------------------ */
++static void
++ssp_dump_cb(unsigned n)
++{
++	uint32_t base = ssp.cb_off + n * ssp.cb_stride;
++	char name[32];
++	uint32_t cbar, sctlr, fsr, ttbcr, ttbcr2, mair0, lo, hi;
++	uint64_t ttbr0, ttbr1, far;
++
++#define SSP_CBNAME(fmt)	(void)snprintf(name, sizeof(name), fmt, n)
++	SSP_CBNAME("CBAR%u");
++	cbar = ssp_rd(name, ssp.gr1_off + SSP_GR1_CBAR(n));
++	SSP_CBNAME("CBFRSYNRA%u");
++	(void)ssp_rd(name, ssp.gr1_off + SSP_GR1_CBFRSYNRA(n));
++	SSP_CBNAME("CBA2R%u");
++	(void)ssp_rd(name, ssp.gr1_off + SSP_GR1_CBA2R(n));
++	SSP_CBNAME("CB%u_SCTLR");
++	sctlr = ssp_rd(name, base + SSP_CB_SCTLR);
++	SSP_CBNAME("CB%u_ACTLR");
++	(void)ssp_rd(name, base + SSP_CB_ACTLR);
++	SSP_CBNAME("CB%u_TTBR0_LO");
++	lo = ssp_rd(name, base + SSP_CB_TTBR0);
++	SSP_CBNAME("CB%u_TTBR0_HI");
++	hi = ssp_rd(name, base + SSP_CB_TTBR0 + 4u);
++	ttbr0 = (uint64_t)lo | ((uint64_t)hi << 32);
++	SSP_CBNAME("CB%u_TTBR1_LO");
++	lo = ssp_rd(name, base + SSP_CB_TTBR1);
++	SSP_CBNAME("CB%u_TTBR1_HI");
++	hi = ssp_rd(name, base + SSP_CB_TTBR1 + 4u);
++	ttbr1 = (uint64_t)lo | ((uint64_t)hi << 32);
++	SSP_CBNAME("CB%u_TTBCR");
++	ttbcr = ssp_rd(name, base + SSP_CB_TTBCR);
++	SSP_CBNAME("CB%u_TTBCR2");
++	ttbcr2 = ssp_rd(name, base + SSP_CB_TTBCR2);
++	SSP_CBNAME("CB%u_CONTEXTIDR");
++	(void)ssp_rd(name, base + SSP_CB_CONTEXTIDR);
++	SSP_CBNAME("CB%u_MAIR0");
++	mair0 = ssp_rd(name, base + SSP_CB_S1_MAIR0);
++	SSP_CBNAME("CB%u_MAIR1");
++	(void)ssp_rd(name, base + SSP_CB_S1_MAIR1);
++	SSP_CBNAME("CB%u_FSR");
++	fsr = ssp_rd(name, base + SSP_CB_FSR);
++	SSP_CBNAME("CB%u_FSYNR0");
++	(void)ssp_rd(name, base + SSP_CB_FSYNR0);
++	SSP_CBNAME("CB%u_FSYNR1");
++	(void)ssp_rd(name, base + SSP_CB_FSYNR1);
++	SSP_CBNAME("CB%u_FAR_LO");
++	lo = ssp_rd(name, base + SSP_CB_FAR_LO);
++	SSP_CBNAME("CB%u_FAR_HI");
++	hi = ssp_rd(name, base + SSP_CB_FAR_HI);
++	far = (uint64_t)lo | ((uint64_t)hi << 32);
++	SSP_CBNAME("CB%u_TLBSTATUS");
++	(void)ssp_rd(name, base + SSP_CB_TLBSTATUS);
++#undef SSP_CBNAME
++
++	printf(SSP_PFX "  CB%u: CBAR 0x%08x type=%u (%s) MEMATTR=0x%x BPSHCFG=%u "
++	    "VMID=%u; SCTLR 0x%08x M=%u CFCFG=%u HUPCF=%u ASIDPNE=%u; TTBR0 "
++	    "0x%016llx (table 0x%llx ASID %llu); TTBR1 0x%016llx; TTBCR "
++	    "0x%08x T0SZ=%u EPD1=%u TG0=%u; TTBCR2 0x%08x; MAIR0 0x%08x; "
++	    "FSR 0x%08x%s; FAR 0x%llx\n", n, cbar, SSP_CBAR_TYPE(cbar),
++	    ssp_cbar_type_name(SSP_CBAR_TYPE(cbar)),
++	    SSP_CBAR_MEMATTR(cbar), SSP_CBAR_BPSHCFG(cbar),
++	    SSP_CBAR_VMID(cbar), sctlr, (sctlr & SSP_SCTLR_M) ? 1u : 0u,
++	    (sctlr & SSP_SCTLR_CFCFG) ? 1u : 0u,
++	    (sctlr & SSP_SCTLR_HUPCF) ? 1u : 0u,
++	    (sctlr & SSP_SCTLR_S1_ASIDPNE) ? 1u : 0u,
++	    (unsigned long long)ttbr0,
++	    (unsigned long long)(ttbr0 & SSP_DESC_ADDR_MASK),
++	    (unsigned long long)(ttbr0 >> 48), (unsigned long long)ttbr1,
++	    ttbcr, ttbcr & 0x3fu, (ttbcr >> 23) & 1u, (ttbcr >> 14) & 3u,
++	    ttbcr2, mair0, fsr, fsr == 0 ? " (no fault)" : " (FAULT LATCHED)",
++	    (unsigned long long)far);
++}
++
++/* ------------------------------------------------------------------ */
++/* The read-only dump.  Everything below reads; nothing writes.        */
++/* ------------------------------------------------------------------ */
++static void
++ssp_probe_run(void)
++{
++	uint32_t v;
++	unsigned i;
++
++	printf(SSP_PFX "--- read-only SMMU dump start (no writes) ---\n");
++	if (ssp.smmu == 0) {
++		ssp.smmu = ml_io_map(CP_SMMU_PA, CP_SMMU_SZ);
++	}
++	if (ssp.smmu == 0) {
++		printf(SSP_PFX "ml_io_map(0x%08x, 0x%x) failed; nothing "
++		    "touched\n", CP_SMMU_PA, CP_SMMU_SZ);
++		return;
++	}
++	printf(SSP_PFX "mapped smmu 0x%08x+0x%x at va 0x%lx\n", CP_SMMU_PA,
++	    CP_SMMU_SZ, (unsigned long)ssp.smmu);
++
++	/* The first read is also the liveness gate: the SMMU is on
++	 * gdsc_gpu_cx and behind gcc_gpu_cfg_ahb_clk, so an unpowered window
++	 * returns 0 and every later read would be a gamble. */
++	ssp.scr0 = ssp_rd("sCR0", SSP_sCR0);
++	if (ssp.scr0 == 0 || ssp.scr0 == 0xffffffffu) {
++		printf(SSP_PFX "sCR0 does not answer (0x%08x); the SMMU window "
++		    "is not clocked.  Boot sweetgpuprobe=1 first (it powers "
++		    "gdsc_gpu_cx and gcc_gpu_cfg_ahb_clk).  Stopping before any "
++		    "other read.\n", ssp.scr0);
++		return;
++	}
++	printf(SSP_PFX "  sCR0: CLIENTPD=%u (0 = clients allowed) GFRE=%u "
++	    "GFIE=%u GCFGFRE=%u GCFGFIE=%u USFCFG=%u VMIDPNE=%u PTM=%u FB=%u "
++	    "BSU=%u; undecoded bits 0x%08x\n",
++	    (ssp.scr0 & SSP_CR0_CLIENTPD) ? 1u : 0u,
++	    (ssp.scr0 & SSP_CR0_GFRE) ? 1u : 0u,
++	    (ssp.scr0 & SSP_CR0_GFIE) ? 1u : 0u,
++	    (ssp.scr0 & SSP_CR0_GCFGFRE) ? 1u : 0u,
++	    (ssp.scr0 & SSP_CR0_GCFGFIE) ? 1u : 0u,
++	    (ssp.scr0 & SSP_CR0_USFCFG) ? 1u : 0u,
++	    (ssp.scr0 & SSP_CR0_VMIDPNE) ? 1u : 0u,
++	    (ssp.scr0 & SSP_CR0_PTM) ? 1u : 0u,
++	    (ssp.scr0 & SSP_CR0_FB) ? 1u : 0u,
++	    (ssp.scr0 >> 14) & 3u,
++	    ssp.scr0 & ~(SSP_CR0_CLIENTPD | SSP_CR0_GFRE | SSP_CR0_GFIE |
++	    SSP_CR0_GCFGFRE | SSP_CR0_GCFGFIE | SSP_CR0_USFCFG |
++	    SSP_CR0_VMIDPNE | SSP_CR0_PTM | SSP_CR0_FB | (3u << 14)));
++	printf(SSP_PFX "  sCR0 note: sCR0 has no SMMUEN bit; bit 1 is GFRE "
++	    "(arm-smmu.c:57).  CLIENTPD=0 is what admits the GPU's "
++	    "transactions at all.\n");
++
++	ssp.idr0 = ssp_rd("IDR0", SSP_ID0);
++	ssp.idr1 = ssp_rd("IDR1", SSP_ID1);
++	ssp.idr2 = ssp_rd("IDR2", SSP_ID2);
++	ssp.idr5 = ssp_rd("IDR5", SSP_ID5);
++
++	printf(SSP_PFX "  IDR0: S1TS=%u S2TS=%u NTS=%u SMS(stream matching)=%u "
++	    "ATOSNS=%u NUMIRPT=%u NUMSIDB=%u NUMSMRG=%u\n",
++	    (ssp.idr0 & SSP_ID0_S1TS) ? 1u : 0u,
++	    (ssp.idr0 & SSP_ID0_S2TS) ? 1u : 0u,
++	    (ssp.idr0 & SSP_ID0_NTS) ? 1u : 0u,
++	    (ssp.idr0 & SSP_ID0_SMS) ? 1u : 0u,
++	    (ssp.idr0 & SSP_ID0_ATOSNS) ? 1u : 0u,
++	    SSP_ID0_NUMIRPT(ssp.idr0), SSP_ID0_NUMSIDB(ssp.idr0),
++	    SSP_ID0_NUMSMRG(ssp.idr0));
++
++	ssp.pgshift = (ssp.idr1 & SSP_ID1_PAGESIZE) ? 16u : 12u;
++	ssp.gr1_off = 1u << ssp.pgshift;
++	ssp.cb_stride = 1u << ssp.pgshift;
++	ssp.cb_off = CP_SMMU_SZ / 2u;	/* ARM_SMMU_CB_BASE = base + size/2 */
++	ssp.num_smr = SSP_ID0_NUMSMRG(ssp.idr0) + 1u;
++	if (ssp.num_smr > 8u) {
++		printf(SSP_PFX "  NUMSMRG says %u SMRs; this probe dumps only "
++		    "the first 8\n", ssp.num_smr);
++		ssp.num_smr = 8u;
++	}
++	ssp.num_cb = SSP_ID1_NUMCB(ssp.idr1) + 1u;
++	if (ssp.num_cb > 8u) {
++		printf(SSP_PFX "  NUMCB says %u context banks; this probe dumps "
++		    "only the first 8\n", ssp.num_cb);
++		ssp.num_cb = 8u;
++	}
++	/* Never read past the window that is mapped: a dead IDR1 (all ones)
++	 * would otherwise put GR1 or a CB page outside 0x10000. */
++	if (ssp.gr1_off + 0x1000u > CP_SMMU_SZ ||
++	    ssp.cb_off + ssp.num_cb * ssp.cb_stride > CP_SMMU_SZ) {
++		printf(SSP_PFX "  IDR1 0x%08x implies GR1 +0x%x / CBs +0x%x for "
++		    "%u banks, which does not fit the 0x%x window: reading the "
++		    "GR0 registers only\n", ssp.idr1, ssp.gr1_off, ssp.cb_off,
++		    ssp.num_cb, CP_SMMU_SZ);
++		ssp.num_cb = 0u;
++		ssp.gr1_off = 0u;
++	}
++
++	printf(SSP_PFX "  IDR1: PAGESIZE=%u pgshift=%u NUMPAGENDXB=%u "
++	    "NUMS2CB=%u NUMCB=%u -> GR1 +0x%x, CB%u..CB%u at +0x%x, one 4 KiB "
++	    "page each\n", (ssp.idr1 & SSP_ID1_PAGESIZE) ? 1u : 0u,
++	    ssp.pgshift, SSP_ID1_NUMPAGENDXB(ssp.idr1),
++	    SSP_ID1_NUMS2CB(ssp.idr1), SSP_ID1_NUMCB(ssp.idr1), ssp.gr1_off,
++	    0u, ssp.num_cb - 1u, ssp.cb_off);
++	printf(SSP_PFX "  IDR2: IAS=%u (%u-bit VA) OAS=%u (%u-bit PA) UBS=%u "
++	    "PTFS 4K=%u 16K=%u 64K=%u\n", SSP_ID2_IAS(ssp.idr2),
++	    32u + 4u * SSP_ID2_IAS(ssp.idr2), SSP_ID2_OAS(ssp.idr2),
++	    32u + 4u * SSP_ID2_OAS(ssp.idr2), SSP_ID2_UBS(ssp.idr2),
++	    (ssp.idr2 & SSP_ID2_PTFS_4K) ? 1u : 0u,
++	    (ssp.idr2 & SSP_ID2_PTFS_16K) ? 1u : 0u,
++	    (ssp.idr2 & SSP_ID2_PTFS_64K) ? 1u : 0u);
++	printf(SSP_PFX "  IDR5: 0x%08x (not decoded: nothing here uses it)\n",
++	    ssp.idr5);
++
++	ssp.sgfsr = ssp_rd("sGFSR", SSP_sGFSR);
++	if (ssp.sgfsr != 0) {
++		(void)ssp_rd("sGFSYNR0", SSP_sGFSYNR0);
++		(void)ssp_rd("sGFSYNR1", SSP_sGFSYNR1);
++	}
++	printf(SSP_PFX "  sGFSR: 0x%08x%s\n", ssp.sgfsr,
++	    ssp.sgfsr == 0 ? " (no global fault latched)" :
++	    " (FAULT latched: MULTI/SS/EF/PF/TF/ASF/AFF/UUT are the legal "
++	    "bits)");
++
++	/* Stream mapping registers: only the implemented ones are read, an
++	 * SMR/S2CR index past NUMSMRG is not backed by a register. */
++	for (i = 0; i < ssp.num_smr; ++i) {
++		char name[24];
++
++		(void)snprintf(name, sizeof(name), "SMR%u", i);
++		ssp.smr[i] = ssp_rd(name, SSP_SMR(i));
++	}
++	for (i = 0; i < ssp.num_smr; ++i) {
++		char name[24];
++
++		(void)snprintf(name, sizeof(name), "S2CR%u", i);
++		ssp.s2cr[i] = ssp_rd(name, SSP_S2CR(i));
++	}
++	if (ssp.num_smr < 8u) {
++		printf(SSP_PFX "  SMR%u..SMR7 / S2CR%u..S2CR7 not read: "
++		    "IDR0.NUMSMRG=%u implements %u (architecture: field + 1)\n",
++		    ssp.num_smr, ssp.num_smr, SSP_ID0_NUMSMRG(ssp.idr0),
++		    ssp.num_smr);
++	}
++	for (i = 0; i < ssp.num_smr; ++i) {
++		uint32_t smr = ssp.smr[i], s2cr = ssp.s2cr[i];
++
++		printf(SSP_PFX "  SMR%u 0x%08x VALID=%u ID=0x%x MASK=0x%x | "
++		    "S2CR%u 0x%08x STYPE=%u (%s) CBNDX=%u PRIVCFG=%u\n", i, smr,
++		    (smr & SSP_SMR_VALID) ? 1u : 0u, SSP_SMR_ID(smr),
++		    SSP_SMR_MASK(smr), i, s2cr, SSP_S2CR_TYPE(s2cr),
++		    ssp_stype_name(SSP_S2CR_TYPE(s2cr)), SSP_S2CR_CBNDX(s2cr),
++		    SSP_S2CR_PRIVCFG(s2cr));
++	}
++
++	/* The answer the whole stage exists for: what the GPU's own SIDs
++	 * resolve to right now. */
++	ssp_report_sid(SSP_SID_USER, "non-secure/user");
++	ssp_report_sid(SSP_SID_SECURE, "secure");
++
++	for (i = 0; i < ssp.num_cb; ++i) {
++		ssp_dump_cb(i);
++	}
++	if (ssp.num_cb < 8u) {
++		printf(SSP_PFX "  CB%u..CB7 not read: IDR1.NUMCB=%u implements "
++		    "%u\n", ssp.num_cb, SSP_ID1_NUMCB(ssp.idr1), ssp.num_cb);
++	}
++
++	/* sCR2 last.  Neither the vendor nor the mainline arm-smmu driver
++	 * ever touches it, so its fields are undefined here; if this is the
++	 * read that does not return, the log stops at its canary and
++	 * everything else is already recorded. */
++	v = ssp_rd("sCR2", SSP_sCR2);
++	printf(SSP_PFX "  sCR2: 0x%08x (not decoded; no driver in either tree "
++	    "defines its fields, which is why it is read last)\n", v);
++
++	printf(SSP_PFX "probe: done: %u reads returned, no register written\n",
++	    ssp.reads);
++}
++
++/* ------------------------------------------------------------------ */
++/* Build the stage-1 tables.                                           */
++/* ------------------------------------------------------------------ */
++static int
++ssp_build_tables(void)
++{
++	volatile uint64_t *tbl, *l1, *l2, *l3;
++	uint64_t first, last, l1_idx, l2_idx;
++	unsigned i;
++
++	if (scp.low == 0) {
++		printf(SSP_PFX "tables: the CP window is not mapped; nothing "
++		    "built\n");
++		return -1;
++	}
++
++	first = scp.region_pa + SSP_MAP_FIRST;
++	last = scp.region_pa + SSP_MAP_LAST;
++	ssp.l1_pa = scp.win_pa + (SSP_L1_IN_WIN - CP_LOW_WIN_OFF);
++	ssp.l2_pa = scp.win_pa + (SSP_L2_IN_WIN - CP_LOW_WIN_OFF);
++	ssp.l3_pa = scp.win_pa + (SSP_L3_IN_WIN - CP_LOW_WIN_OFF);
++	tbl = (volatile uint64_t *)(scp.low + (SSP_TBL_IN_WIN -
++	    CP_LOW_WIN_OFF));
++	l1 = tbl;
++	l2 = (volatile uint64_t *)(scp.low + (SSP_L2_IN_WIN - CP_LOW_WIN_OFF));
++	l3 = (volatile uint64_t *)(scp.low + (SSP_L3_IN_WIN - CP_LOW_WIN_OFF));
++
++	printf(SSP_PFX "tables: L1 phys 0x%llx L2 0x%llx L3 0x%llx (%u KiB at "
++	    "region +0x%llx, i.e. CP-window +0x%x), identity-mapping "
++	    "VA 0x%llx..0x%llx\n", (unsigned long long)ssp.l1_pa,
++	    (unsigned long long)ssp.l2_pa, (unsigned long long)ssp.l3_pa,
++	    SSP_TBL_SIZE >> 10,
++	    (unsigned long long)(SSP_TBL_IN_WIN + CP_LOW_WIN_OFF),
++	    SSP_TBL_IN_WIN, (unsigned long long)first,
++	    (unsigned long long)last);
++
++	/* Zero all four tables (three used, one spare). */
++	for (i = 0; i < SSP_TBL_SIZE / 8u; ++i) {
++		tbl[i] = 0;
++	}
++
++	/* With IAS = 36 bits the walk starts at level 1 (1 GiB per entry), so
++	 * the L1 index is VA[38:30] and the L2 index VA[29:21].  This range
++	 * fits one 2 MiB zone, so one L1 and one L2 entry suffice; refuse
++	 * rather than map the wrong zone if the layout ever changes. */
++	l1_idx = (first >> 30) & 0x1ffu;
++	l2_idx = (first >> 21) & 0x1ffu;
++	if (l1_idx != (((last - 1) >> 30) & 0x1ffu) ||
++	    l2_idx != (((last - 1) >> 21) & 0x1ffu)) {
++		printf(SSP_PFX "tables: VA 0x%llx..0x%llx crosses a 1 GiB or "
++		    "2 MiB boundary; this builder maps one 2 MiB zone, nothing "
++		    "built\n", (unsigned long long)first,
++		    (unsigned long long)last);
++		return -1;
++	}
++
++	l1[l1_idx] = (ssp.l2_pa & SSP_DESC_ADDR_MASK) | SSP_DESC_TABLE;
++	l2[l2_idx] = (ssp.l3_pa & SSP_DESC_ADDR_MASK) | SSP_DESC_TABLE;
++
++	ssp.pages = 0;
++	for (uint64_t pa = first; pa < last; pa += 0x1000ull) {
++		/* Normal, non-cacheable (MAIR index 0): the CPU writes these
++		 * buffers through ml_io_map_wcomb(), i.e. non-cacheable, so a
++		 * cacheable GPU mapping could hold a stale copy that nothing
++		 * ever invalidates.  XN/UXN stay 0 because the CP *fetches
++		 * instructions* from these pages. */
++		l3[(pa >> 12) & 0x1ffu] = (pa & SSP_DESC_ADDR_MASK) |
++		    SSP_DESC_ATTR_IDX(SSP_ATTR_NC) | SSP_DESC_SH_INNER |
++		    SSP_DESC_AF | SSP_DESC_PAGE;
++		ssp.pages++;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	printf(SSP_PFX "tables: L1[%llu] = 0x%llx, L2[%llu] = 0x%llx, %u page "
++	    "entries L3[..], each PA|0x%llx (attr idx %u = MAIR0 0x%02x, AF, "
++	    "SH=inner, AP=RW, XN=0)\n", (unsigned long long)l1_idx,
++	    (unsigned long long)l1[l1_idx], (unsigned long long)l2_idx,
++	    (unsigned long long)l2[l2_idx], ssp.pages,
++	    (unsigned long long)(SSP_DESC_ATTR_IDX(SSP_ATTR_NC) |
++	    SSP_DESC_SH_INNER | SSP_DESC_AF | SSP_DESC_PAGE), SSP_ATTR_NC,
++	    SSP_MAIR0_VALUE & 0xffu);
++	return 0;
++}
++
++/* Software walk of the tables just built: prints what the SMMU *should* see.
++ * This proves the tables, not the SMMU's use of them (that is what ATOS is
++ * for). */
++static void
++ssp_sw_walk(uint64_t va)
++{
++	volatile uint64_t *l1 = (volatile uint64_t *)(scp.low +
++	    (SSP_L1_IN_WIN - CP_LOW_WIN_OFF));
++	volatile uint64_t *l2 = (volatile uint64_t *)(scp.low +
++	    (SSP_L2_IN_WIN - CP_LOW_WIN_OFF));
++	volatile uint64_t *l3 = (volatile uint64_t *)(scp.low +
++	    (SSP_L3_IN_WIN - CP_LOW_WIN_OFF));
++	uint64_t e1, e2, e3, pa;
++
++	e1 = l1[(va >> 30) & 0x1ffu];
++	e2 = l2[(va >> 21) & 0x1ffu];
++	e3 = l3[(va >> 12) & 0x1ffu];
++	pa = e3 & SSP_DESC_ADDR_MASK;
++	printf(SSP_PFX "walk 0x%llx: L1[%llu]=0x%llx L2[%llu]=0x%llx "
++	    "L3[%llu]=0x%llx -> %s 0x%llx\n", (unsigned long long)va,
++	    (unsigned long long)((va >> 30) & 0x1ffu), (unsigned long long)e1,
++	    (unsigned long long)((va >> 21) & 0x1ffu), (unsigned long long)e2,
++	    (unsigned long long)((va >> 12) & 0x1ffu), (unsigned long long)e3,
++	    ((e1 & 3ull) == SSP_DESC_TABLE && (e2 & 3ull) == SSP_DESC_TABLE &&
++	    (e3 & 3ull) == SSP_DESC_PAGE) ?
++	    (pa == (va & SSP_DESC_ADDR_MASK) ? "PA (identity)" : "PA") :
++	    "NOT MAPPED, would-be PA",
++	    (unsigned long long)pa);
++}
++
++/* Stage-1 translation through the SMMU itself: ATS1PR + ATSR, with the qcom
++ * micro MMU halted around it (arm-smmu.c __arm_smmu_iova_to_phys_hard() does
++ * the same; qcom,halt-and-tlb-on-atos exists because some of these SMMUs
++ * cannot do ATS otherwise).  Opt-in: it is the only access here that can
++ * leave the SMMU halted if it goes wrong, and the ME is not running anyway. */
++static void
++ssp_atos(uint64_t va)
++{
++	uint32_t ctrl, off = SSP_IMPL_DEF1 + SSP_MICRO_MMU_CTRL;
++	uint64_t par;
++	int i;
++
++	printf(SSP_PFX "atos: halting the micro MMU (IMPL_DEF1 +0x%x)\n",
++	    SSP_IMPL_DEF1);
++	ctrl = scp_rd(ssp.smmu, off);
++	(void)ssp_wr("MICRO_MMU_CTRL(halt)", off, ctrl | SSP_MICRO_HALT_REQ);
++	for (i = 0; i < 30; ++i) {
++		if (scp_rd(ssp.smmu, off) & SSP_MICRO_IDLE) {
++			break;
++		}
++		delay(1000);
++	}
++	if (i == 30) {
++		printf(SSP_PFX "atos: the micro MMU never reported IDLE; not "
++		    "issuing ATS1PR (the SMMU may still be running)\n");
++		return;
++	}
++	printf(SSP_PFX "atos: halted (MICRO_MMU_CTRL 0x%08x)\n",
++	    scp_rd(ssp.smmu, off));
++
++	(void)ssp_wr64("CB0_ATS1PR", ssp.cb_off + SSP_CB_ATS1PR,
++	    va & ~0xfffull);
++	if (ssp_poll(ssp.cb_off + SSP_CB_ATSR, SSP_ATSR_ACTIVE, 0, 50,
++	    "CB0_ATSR") == 0) {
++		uint32_t lo = scp_rd(ssp.smmu, ssp.cb_off + SSP_CB_PAR_LO);
++		uint32_t hi = scp_rd(ssp.smmu, ssp.cb_off + SSP_CB_PAR_HI);
++
++		par = (uint64_t)lo | ((uint64_t)hi << 32);
++		printf(SSP_PFX "atos: PAR 0x%016llx%s -> PA 0x%llx%s\n",
++		    (unsigned long long)par,
++		    (par & SSP_PAR_F) ? " (F set: translation FAULT)" : "",
++		    (unsigned long long)(par & SSP_DESC_ADDR_MASK),
++		    (par & SSP_DESC_ADDR_MASK) == (va & SSP_DESC_ADDR_MASK) ?
++		    " (identity, as mapped)" : " (NOT the mapped PA)");
++	}
++
++	ctrl = scp_rd(ssp.smmu, off);
++	(void)ssp_wr("MICRO_MMU_CTRL(resume)", off, ctrl & ~SSP_MICRO_HALT_REQ);
++}
++
++/* ------------------------------------------------------------------ */
++/* Program CB0 + SMR0 + S2CR0 for SID 0.                               */
++/* ------------------------------------------------------------------ */
++static int
++ssp_program(void)
++{
++	uint32_t cb = ssp.cb_off;
++	uint32_t smr, s2cr, cbar, sctlr, fsr, sgfsr;
++
++	printf(SSP_PFX "--- programming CB0 for SID %u (stage 1, stage 2 "
++	    "bypass) ---\n", SSP_SID_USER);
++
++	/* Quiesce first, so no in-flight walk can see a half-written
++	 * context (CB0 may already have M=1 from the boot chain). */
++	(void)ssp_wr("CB0_SCTLR(off)", cb + SSP_CB_SCTLR, 0u);
++
++	/* CBA2R before CBAR: arm_smmu_init_context_bank() says it *must*
++	 * precede it (VMID16 architectural oversight). */
++	(void)ssp_wr("CBA2R0", ssp.gr1_off + SSP_GR1_CBA2R(0), 1u);
++	(void)ssp_wr("CBAR0", ssp.gr1_off + SSP_GR1_CBAR(0), SSP_CBAR0_VALUE);
++	(void)ssp_wr64("CB0_TTBR0", cb + SSP_CB_TTBR0,
++	    (ssp.l1_pa & SSP_DESC_ADDR_MASK) | ((uint64_t)SSP_ASID << 48));
++	(void)ssp_wr64("CB0_TTBR1", cb + SSP_CB_TTBR1, 0ull);
++	(void)ssp_wr("CB0_TTBCR2", cb + SSP_CB_TTBCR2, SSP_TTBCR2_VALUE);
++	(void)ssp_wr("CB0_TTBCR", cb + SSP_CB_TTBCR, SSP_TTBCR0_VALUE);
++	(void)ssp_wr("CB0_MAIR0", cb + SSP_CB_S1_MAIR0, SSP_MAIR0_VALUE);
++	(void)ssp_wr("CB0_MAIR1", cb + SSP_CB_S1_MAIR1, SSP_MAIR1_VALUE);
++	(void)ssp_wr("CB0_CONTEXTIDR", cb + SSP_CB_CONTEXTIDR, SSP_ASID);
++
++	/* Translation on.  CFCFG deliberately clear and HUPCF set, like
++	 * qcom_adreno_smmu_write_sctlr(): a fault terminates and is recorded
++	 * instead of stalling the GPU, because a stall would be
++	 * indistinguishable from the 0141 wedge.  ACTLR is
++	 * implementation-defined; the vendor writes 0x70000000 there
++	 * (ISH|OSH|NSH attribute overrides) and this mode leaves it alone. */
++	(void)ssp_wr("CB0_SCTLR", cb + SSP_CB_SCTLR, SSP_SCTLR0_VALUE);
++
++	/* Invalidate whatever this ASID cached, then wait for it
++	 * (arm_smmu_tlb_inv_context() + arm_smmu_tlb_sync_cb()). */
++	(void)ssp_wr("CB0_S1_TLBIASID", cb + SSP_CB_S1_TLBIASID, SSP_ASID);
++	(void)ssp_wr("CB0_TLBSYNC", cb + SSP_CB_TLBSYNC, 0u);
++	if (ssp_poll(cb + SSP_CB_TLBSTATUS, SSP_TLBSTATUS_ACTIVE, 0, 500,
++	    "CB0_TLBSYNC") != 0) {
++		printf(SSP_PFX "the TLB maintenance never completed; SID %u is "
++		    "left alone\n", SSP_SID_USER);
++		return -1;
++	}
++
++	/* Stream mapping.  Any other valid SMR that also matches SID 0 and
++	 * nothing else is invalidated first: the architecture resolves
++	 * multiple matches by index and this code relies on SMR0 winning, so
++	 * a broader match is reported rather than silently shadowed. */
++	for (unsigned i = 1; i < ssp.num_smr; ++i) {
++		char name[24];
++
++		smr = ssp.smr[i];
++		if (!(smr & SSP_SMR_VALID)) {
++			continue;
++		}
++		if ((SSP_SID_USER ^ SSP_SMR_ID(smr)) & ~SSP_SMR_MASK(smr)) {
++			continue;
++		}
++		if (SSP_SMR_MASK(smr) == 0 &&
++		    SSP_SMR_ID(smr) == SSP_SID_USER) {
++			printf(SSP_PFX "SMR%u (0x%08x) also matches SID %u with "
++			    "mask 0; invalidating it so SMR0 is the only "
++			    "match\n", i, smr, SSP_SID_USER);
++			(void)snprintf(name, sizeof(name), "SMR%u(invalid)", i);
++			(void)ssp_wr(name, SSP_SMR(i), 0u);
++		} else {
++			printf(SSP_PFX "WARNING: SMR%u (0x%08x, mask 0x%x) also "
++			    "matches SID %u; SMR0 should win, but if the GPU "
++			    "still faults check this pair\n", i, smr,
++			    SSP_SMR_MASK(smr), SSP_SID_USER);
++		}
++	}
++	if ((ssp.smr[0] & SSP_SMR_VALID) &&
++	    SSP_SMR_ID(ssp.smr[0]) != SSP_SID_USER) {
++		printf(SSP_PFX "note: SMR0 was VALID for ID 0x%x; it becomes "
++		    "SID %u's matcher\n", SSP_SMR_ID(ssp.smr[0]),
++		    SSP_SID_USER);
++	}
++	(void)ssp_wr("SMR0", SSP_SMR(0), SSP_SMR_VALID | SSP_SID_USER);
++	/* S2CR last: from here on SID 0 translates through CB0. */
++	(void)ssp_wr("S2CR0", SSP_S2CR(0),
++	    (SSP_S2CR_TYPE_TRANS << 16) | 0u);
++
++	ssp.programmed = 1;
++
++	/* Read the result back the way the probe does. */
++	smr = scp_rd(ssp.smmu, SSP_SMR(0));
++	s2cr = scp_rd(ssp.smmu, SSP_S2CR(0));
++	cbar = scp_rd(ssp.smmu, ssp.gr1_off + SSP_GR1_CBAR(0));
++	sctlr = scp_rd(ssp.smmu, cb + SSP_CB_SCTLR);
++	fsr = scp_rd(ssp.smmu, cb + SSP_CB_FSR);
++	sgfsr = scp_rd(ssp.smmu, SSP_sGFSR);
++	printf(SSP_PFX "read-back: SMR0 0x%08x, S2CR0 0x%08x (STYPE=%u %s "
++	    "CBNDX=%u), CBAR0 0x%08x (type=%u %s), CB0_SCTLR 0x%08x (M=%u), "
++	    "CB0_FSR 0x%08x%s, sGFSR 0x%08x%s\n", smr, s2cr,
++	    SSP_S2CR_TYPE(s2cr), ssp_stype_name(SSP_S2CR_TYPE(s2cr)),
++	    SSP_S2CR_CBNDX(s2cr), cbar, SSP_CBAR_TYPE(cbar),
++	    ssp_cbar_type_name(SSP_CBAR_TYPE(cbar)), sctlr,
++	    (sctlr & SSP_SCTLR_M) ? 1u : 0u, fsr,
++	    fsr == 0 ? " (clean)" : " (FAULT)", sgfsr,
++	    sgfsr == 0 ? " (clean)" : " (FAULT)");
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* The decision: is a mapping needed at all?                           */
++/* ------------------------------------------------------------------ */
++static int
++ssp_decide(void)
++{
++	unsigned idx = 0;
++	uint32_t s2cr = 0;
++
++	if (ssp_sid_match(SSP_SID_USER, &idx, &s2cr) != 0) {
++		printf(SSP_PFX "decision: SID %u matches no SMR today, so the "
++		    "SMMU treats it as an unidentified stream; mapping it "
++		    "replaces that with a real context\n", SSP_SID_USER);
++		return 0;
++	}
++	printf(SSP_PFX "decision: SID %u currently resolves to SMR%u/S2CR%u = "
++	    "STYPE %u (%s), CBNDX %u\n", SSP_SID_USER, idx, idx,
++	    SSP_S2CR_TYPE(s2cr), ssp_stype_name(SSP_S2CR_TYPE(s2cr)),
++	    SSP_S2CR_CBNDX(s2cr));
++	if (SSP_S2CR_TYPE(s2cr) == SSP_S2CR_TYPE_BYPASS && !ssp.force) {
++		printf(SSP_PFX "decision: SID %u is BYPASSED, so the CP's "
++		    "physical addresses are already correct and there is "
++		    "nothing to map: no register will be written.  "
++		    "(sweetsmmuforce=1 programs anyway, to prove the write "
++		    "path.)\n", SSP_SID_USER);
++		return 1;
++	}
++	if (SSP_S2CR_TYPE(s2cr) == SSP_S2CR_TYPE_FAULT) {
++		printf(SSP_PFX "decision: SID %u currently FAULTS, so the GPU "
++		    "cannot fetch at all; mapping it replaces the fault\n",
++		    SSP_SID_USER);
++	}
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* sweetsmmumap=1                                                      */
++/* ------------------------------------------------------------------ */
++static void
++ssp_map_run(void)
++{
++	uint32_t v;
++
++	printf(SSP_PFX "--- SMMU stage-1 map mode start (the ME is not "
++	    "started) ---\n");
++
++	/* Power (idempotent, the same sequence the CP stages use) and map
++	 * the SMMU, then the CP window the tables live in. */
++	if (scp_power_up() != 0) {
++		printf(SSP_PFX "map: power-up failed; nothing built, nothing "
++		    "written\n");
++		return;
++	}
++	ssp.smmu = scp.smmu;
++	if (scp_map_low() != 0) {
++		printf(SSP_PFX "map: no CP window; nothing built, nothing "
++		    "written\n");
++		return;
++	}
++
++	ssp_probe_run();
++	if (ssp.smmu == 0 || ssp.scr0 == 0 || ssp.scr0 == 0xffffffffu) {
++		printf(SSP_PFX "map: the probe did not get a live SMMU; "
++		    "nothing built, nothing written\n");
++		return;
++	}
++	if (ssp.num_cb == 0u || ssp.gr1_off == 0u) {
++		printf(SSP_PFX "map: the ID registers do not describe a context "
++		    "bank layout that fits the mapped window (IDR1 0x%08x); "
++		    "nothing written\n", ssp.idr1);
++		return;
++	}
++	if (!(ssp.idr2 & SSP_ID2_PTFS_4K)) {
++		printf(SSP_PFX "map: IDR2 0x%08x says 4 KiB pages are not "
++		    "supported; this builder only does 4 KiB, nothing "
++		    "written\n", ssp.idr2);
++		return;
++	}
++	if (ssp.idr0 != 0 && !(ssp.idr0 & SSP_ID0_S1TS)) {
++		printf(SSP_PFX "map: IDR0 0x%08x says stage 1 is not "
++		    "supported; nothing written\n", ssp.idr0);
++		return;
++	}
++	if (ssp_decide() != 0) {
++		printf(SSP_PFX "map: done: no register written (SID %u needs "
++		    "no mapping); the CP stage can keep using physical "
++		    "addresses\n", SSP_SID_USER);
++		return;
++	}
++
++	printf(SSP_PFX "map: the buffers this maps (VA == PA): pfp 0x%llx pm4 "
++	    "0x%llx ring 0x%llx ib 0x%llx scratch 0x%llx\n",
++	    (unsigned long long)scp.pfp_pa, (unsigned long long)scp.pm4_pa,
++	    (unsigned long long)scp.ring_pa, (unsigned long long)scp.ib_pa,
++	    (unsigned long long)scp.scratch_pa);
++	if (ssp_build_tables() != 0) {
++		return;
++	}
++	if (ssp_program() != 0) {
++		return;
++	}
++
++	/* Verify from every side that does not start the ME. */
++	ssp_sw_walk(scp.pfp_pa);
++	ssp_sw_walk(scp.ring_pa);
++	ssp_sw_walk(scp.scratch_pa);
++	v = scp_rd(scp.kgsl, CP_RBBM_STATUS3);
++	printf(SSP_PFX "verify: RBBM_STATUS3 0x%08x SMMU_STALLED_ON_FAULT=%u "
++	    "(the ME is halted, so a stalled SMMU here would mean the mapping "
++	    "itself is being walked)\n", v,
++	    (v & CP_STATUS3_SMMU_STALL) ? 1u : 0u);
++
++	if (ssp.atos) {
++		ssp_atos(scp.ring_pa);
++	} else {
++		printf(SSP_PFX "verify: ATOS skipped (sweetsmmuatos=1 would "
++		    "translate one address through the SMMU itself)\n");
++	}
++
++	printf(SSP_PFX "map: done: SID %u -> CB0 stage-1 translation, %u pages "
++	    "(0x%llx..0x%llx) identity-mapped.  CP_ME_CNTL was NOT written, "
++	    "so the ME is still halted; the next boot is the one that starts "
++	    "it.  See mi6/docs/4k/gpu-smmu.md\n", SSP_SID_USER, ssp.pages,
++	    (unsigned long long)(scp.region_pa + SSP_MAP_FIRST),
++	    (unsigned long long)(scp.region_pa + SSP_MAP_LAST));
++}
++
+ /* ------------------------------------------------------------------ */
+ /* Thread + entry point                                                */
+ /* ------------------------------------------------------------------ */
+@@ -1598,6 +2750,16 @@ scp_thread(__unused void *arg, __unused wait_result_t wr)
+ 	case SCP_MODE_FULL:
+ 		scp_run();
+ 		break;
++	case SCP_MODE_SMMU_PROBE:
++		/* Read-only: no power-up write, so the window must already be
++		 * clocked (sweetgpuprobe=1 earlier in this boot). */
++		ssp_probe_run();
++		printf(SSP_PFX "probe: mode done; no register was written and "
++		    "the CP was never touched\n");
++		break;
++	case SCP_MODE_SMMU_MAP:
++		ssp_map_run();
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -1613,6 +2775,10 @@ sweet_cp_init(void)
+ 	int probe = 0;
+ 	int write = 0;
+ 	int secvid = 1;
++	int smmuprobe = 0;
++	int smmumap = 0;
++	int smmuforce = 0;
++	int smmuatos = 0;
+ 	int delay_s = 0;
+ 	thread_t thread;
+ 
+@@ -1625,6 +2791,12 @@ sweet_cp_init(void)
+ 	(void)PE_parse_boot_argn("sweetcpfull", &full, sizeof(full));
+ 	(void)PE_parse_boot_argn("sweetcpprobe", &probe, sizeof(probe));
+ 	(void)PE_parse_boot_argn("sweetcpwrite", &write, sizeof(write));
++	(void)PE_parse_boot_argn("sweetsmmuprobe", &smmuprobe,
++	    sizeof(smmuprobe));
++	(void)PE_parse_boot_argn("sweetsmmumap", &smmumap, sizeof(smmumap));
++	(void)PE_parse_boot_argn("sweetsmmuforce", &smmuforce,
++	    sizeof(smmuforce));
++	(void)PE_parse_boot_argn("sweetsmmuatos", &smmuatos, sizeof(smmuatos));
+ 
+ 	/* A typo in the index must not silently fall through to another
+ 	 * mode: refuse the boot arg before anything runs. */
+@@ -1634,23 +2806,47 @@ sweet_cp_init(void)
+ 		return;
+ 	}
+ 
+-	if (!probe && write == 0 && !(enabled && full)) {
++	if (!probe && write == 0 && !(enabled && full) && !smmuprobe &&
++	    !smmumap) {
+ 		if (enabled && !full) {
+ 			printf(CP_PFX "sweetcp=1 no longer runs the full 0141 "
+ 			    "path by itself (it wedged the phone on its first "
+ 			    "hardware run).  Add sweetcpfull=1 for that, or "
+-			    "use sweetcpprobe=1 / sweetcpwrite=<n>.\n");
++			    "use sweetsmmuprobe=1 / sweetsmmumap=1 (0143), "
++			    "sweetcpprobe=1 or sweetcpwrite=<n>.\n");
+ 		} else if (full && !enabled) {
+ 			printf(CP_PFX "sweetcpfull=1 needs sweetcp=1 as well; "
+ 			    "nothing run\n");
+ 		} else {
+ 			printf(CP_PFX "disabled (no sweetcpprobe, "
+-			    "sweetcpwrite or sweetcp+sweetcpfull)\n");
++			    "sweetcpwrite, sweetsmmuprobe, sweetsmmumap or "
++			    "sweetcp+sweetcpfull)\n");
+ 		}
+ 		return;
+ 	}
+ 
+-	if (probe) {
++	/* The SMMU modes win: they are the ones that can explain a CP fetch
++	 * fault, and map mode performs the read-only dump itself. */
++	if (smmumap || smmuprobe) {
++		scp_mode = smmumap ? SCP_MODE_SMMU_MAP : SCP_MODE_SMMU_PROBE;
++		ssp.force = (smmuforce != 0);
++		ssp.atos = (smmuatos != 0);
++		delay_s = 30;
++		(void)PE_parse_boot_argn("sweetsmmudelay", &delay_s,
++		    sizeof(delay_s));
++		if (enabled) {
++			printf(CP_PFX "sweetcp=1 ignored: the SMMU mode "
++			    "wins\n");
++		}
++		if (write != 0) {
++			printf(CP_PFX "sweetcpwrite=%d ignored: the SMMU mode "
++			    "wins\n", write);
++		}
++		if (smmumap && smmuprobe) {
++			printf(SSP_PFX "sweetsmmuprobe=1 ignored: sweetsmmumap=1 "
++			    "runs the same dump first\n");
++		}
++	} else if (probe) {
+ 		scp_mode = SCP_MODE_PROBE;
+ 		delay_s = 30;
+ 		(void)PE_parse_boot_argn("sweetcpprobedelay", &delay_s,
+@@ -1708,6 +2904,19 @@ sweet_cp_init(void)
+ 		    "in %u s (needs the zap from this boot: sweetzap=1)\n",
+ 		    scp.delay_s);
+ 		break;
++	case SCP_MODE_SMMU_PROBE:
++		printf(SSP_PFX "probe enabled: read-only SMMU dump in %u s (no "
++		    "writes; needs the GPU window clocked, so run "
++		    "sweetgpuprobe=1, and post-zap, so run sweetzap=1)\n",
++		    scp.delay_s);
++		break;
++	case SCP_MODE_SMMU_MAP:
++		printf(SSP_PFX "map enabled: SMMU dump, then a stage-1 identity "
++		    "map for SID %u in %u s (only if SID %u is not bypass; "
++		    "force=%d atos=%d; never writes a CP register, so the ME "
++		    "stays halted)\n", SSP_SID_USER, scp.delay_s,
++		    SSP_SID_USER, ssp.force, ssp.atos);
++		break;
+ 	default:
+ 		printf(CP_PFX "internal error: no mode selected\n");
+ 		return;
