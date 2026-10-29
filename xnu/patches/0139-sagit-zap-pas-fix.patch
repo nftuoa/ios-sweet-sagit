@@ -14,11 +14,11 @@ index 2107c5c..95e5379 100644
 + * does neither: there are two buffers and a specific order
 + * (subsys-pil-tz.c:582-680, peripheral-loader.c:883-1000):
   *
-- *   init_image(13, phys(image))     fn 0x02000201 arginfo 0x82 (VAL, RW)
+- *   init_image(13, phys(image))     fn 0x02000201 arginfo 0x42 (VAL, RW)
 - *   mem_setup(13, phys, size)       fn 0x02000202 arginfo 0x3
 - *   auth_and_reset(13)              fn 0x02000205 arginfo 0x1
 - *   shutdown(13)                    fn 0x02000206 arginfo 0x1  (error path)
-+ *   1. init_image(13, phys(metadata))     arginfo 0x82 (VAL, RW)
++ *   1. init_image(13, phys(metadata))     arginfo 0x42 (VAL, RW)
 + *      The metadata is the firmware *file* <name>.mdt, exactly as
 + *      pil_boot() reads it and hands it over (fw->data, fw->size): ELF
 + *      header, the program header table, and the hash segment appended
@@ -874,7 +874,7 @@ index 2107c5c..95e5379 100644
 -	 * the image is not written back by anything we rely on. */
 -	ret = sweet_zap_issue(mask, tag, "init_image", SCM_PAS_INIT_IMAGE,
 +	/*
-+	 * 1. init_image(13, phys(metadata)), arginfo 0x82 = SCM_ARGS(2, SCM_VAL,
++	 * 1. init_image(13, phys(metadata)), arginfo 0x42 = SCM_ARGS(2, SCM_VAL,
 +	 * SCM_RW).  The metadata is <name>.mdt: header, phdrs and the hash
 +	 * segment appended after them.  The monitor parses it here and keeps
 +	 * what it needs for mem_setup and auth_and_reset.

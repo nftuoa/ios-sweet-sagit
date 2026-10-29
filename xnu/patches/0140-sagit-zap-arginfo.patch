@@ -1,0 +1,29 @@
+--- a/bsd/dev/sweet_scm.c
++++ b/bsd/dev/sweet_scm.c
+@@ -85,7 +85,7 @@
+  *        PAS_AUTH_AND_RESET_CMD  = 5   fn 0x02000205
+  *        PAS_SHUTDOWN_CMD        = 6   fn 0x02000206
+  *    and their exact descriptors:
+- *        init_image      : arginfo SCM_ARGS(2, SCM_VAL, SCM_RW) = 0x42,
++ *        init_image      : arginfo SCM_ARGS(2, SCM_VAL, SCM_RW) = 0x82,
+  *                          args[0] = pas_id, args[1] = physical address of
+  *                          the image metadata buffer (:582-643).
+  *        mem_setup       : arginfo SCM_ARGS(3) = 0x3,
+@@ -189,7 +189,7 @@
+ #define SCM_SVC_INFO		0x6u
+ 
+ #define SCM_ARGS1		0x00000001ull	/* SCM_ARGS(1)          */
+-#define SCM_ARGS2_VAL_RW	0x00000042ull	/* SCM_ARGS(2, VAL, RW) */
++#define SCM_ARGS2_VAL_RW	0x00000082ull	/* SCM_ARGS(2, VAL, RW): (0<<4)|(2<<6)|2 */
+ #define SCM_ARGS3		0x00000003ull	/* SCM_ARGS(3)          */
+ 
+ /* drivers/soc/qcom/scm.c:57 and :1150 */
+@@ -512,7 +512,7 @@
+  * does neither: there are two buffers and a specific order
+  * (subsys-pil-tz.c:582-680, peripheral-loader.c:883-1000):
+  *
+- *   1. init_image(13, phys(metadata))     arginfo 0x42 (VAL, RW)
++ *   1. init_image(13, phys(metadata))     arginfo 0x82 (VAL, RW)
+  *      The metadata is the firmware *file* <name>.mdt, exactly as
+  *      pil_boot() reads it and hands it over (fw->data, fw->size): ELF
+  *      header, the program header table, and the hash segment appended
