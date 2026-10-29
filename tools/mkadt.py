@@ -113,7 +113,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, machine='sweet'):
+def build(seed=None, qemu=False, highmem=False, machine='sweet', ident='d22'):
     """machine selects the board; qemu=True swaps in QEMU virt's GIC/CNTFRQ."""
     m = MACHINES[machine]
     phys_base, mem_size = ((m['high_phys_base'], m['high_mem_size']) if highmem
@@ -260,22 +260,34 @@ def build(seed=None, qemu=False, highmem=False, machine='sweet'):
     # as a plain plist instead of decrypting it with the effaceable key.
     defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1))])
 
-    # MobileGestalt HomeButtonType = IODeviceTree:/buttons home-button-type
-    # (D22AP: 2, no Home button; absent = 0 = Home-button device).
+    # ident d22 = iPhone X (no home button), ident d21 = iPhone 8 Plus (home
+    # button).  MobileGestalt reads HomeButtonType from this node.
+    home_button_type = 2 if ident != 'd21' else 0
     buttons = node('buttons', [
         ph(),
         ('button-names', cstr('volup') + cstr('voldown') + cstr('hold')),
-        ('home-button-type', u32(2)),
+        ('home-button-type', u32(home_button_type)),
         ('opposed-power-vol-buttons', u32(1)),
     ])
 
-    product_props = d22ap_product()
-    product = [node('product', [ph()] + product_props)] if product_props else []
-
-    # Identity of the iPhone X whose userland runs here: compatible[0] is
-    # hw.model/hw.target (D22AP), model is hw.machine/hw.product
-    # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
-    compat = [cstr('D22AP'), cstr('iPhone10,3'), cstr('xiaomi,' + machine)]
+    # ident d22 = iPhone X (D22AP / iPhone10,3, no home button, 1125x2436).
+    # ident d21 = iPhone 8 Plus (D21AP / iPhone10,2, home button, 1080x1920
+    # panel whose UIKit canvas is 1242x2208 at scale 2.608).  There is no D21
+    # ADT dump here, so the /product node is omitted for d21 and MobileGestalt
+    # falls back to the identity strings below.
+    if ident == 'd21':
+        product = []
+        compat = [cstr('D21AP'), cstr('iPhone10,2'), cstr('xiaomi,' + machine)]
+        model = 'iPhone10,2'
+        target_type, target_sub_type = 'D21', 'D21AP'
+        home_button_type = 0      # home-button device (already set above)
+    else:
+        product_props = d22ap_product()
+        product = [node('product', [ph()] + product_props)] if product_props else []
+        compat = [cstr('D22AP'), cstr('iPhone10,3'), cstr('xiaomi,' + machine)]
+        model = 'iPhone10,3'
+        target_type, target_sub_type = 'D22', 'D22AP'
+        home_button_type = 2      # no home button
     if machine != 'sweet':
         # SweetPlatformExpert's IONameMatch stays 'xiaomi,sweet'; keep it in
         # the list so an unmodified kernel matches a new board.
@@ -284,9 +296,9 @@ def build(seed=None, qemu=False, highmem=False, machine='sweet'):
     return node('device-tree', [
         ph(),
         ('compatible', b''.join(compat)),
-        ('model', cstr('iPhone10,3')),
-        ('target-type', cstr('D22')),
-        ('target-sub-type', cstr('D22AP')),
+        ('model', cstr(model)),
+        ('target-type', cstr(target_type)),
+        ('target-sub-type', cstr(target_sub_type)),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
@@ -302,7 +314,11 @@ if __name__ == '__main__':
             machine = 'sagit'
         elif a == '--polaris':
             machine = 'sagit'
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, machine=machine)
+    ident = 'd22'
+    for i, a in enumerate(sys.argv):
+        if a == '--ident' and i + 1 < len(sys.argv):
+            ident = sys.argv[i + 1]
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, machine=machine, ident=ident)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
