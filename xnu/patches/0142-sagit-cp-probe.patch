@@ -1,0 +1,637 @@
+diff --git a/bsd/dev/sweet_gpu_cp.c b/bsd/dev/sweet_gpu_cp.c
+index 8c77bdf..fff5e26 100644
+--- a/bsd/dev/sweet_gpu_cp.c
++++ b/bsd/dev/sweet_gpu_cp.c
+@@ -16,8 +16,27 @@
+  *   the kernel's own mapping: if it holds "CPOK" the CP fetched its
+  *   microcode, parsed the ring, fetched the IB and executed a packet.
+  *
+- * Off unless sweetcp=1.  Non-fatal: every failure is one line and the boot
+- * continues.
++ * 0142 replaces the "all writes at once" first run with two safe experiments,
++ * because the first hardware run of 0141 wedged the whole machine on an MMIO
++ * access to a gated register and an MMIO access cannot be timed out:
++ *
++ *   sweetcpprobe=1     read-only dump of the RBBM and CP register file.  Every
++ *                      read is preceded by a "probe NAME ..." line; if the
++ *                      read blocks the CPU (and the fabric, which is why the
++ *                      persistent ring stops too), that last line names the
++ *                      register.  Nothing is written and the SMMU is not even
++ *                      mapped.
++ *   sweetcpwrite=<n>   power the block up, copy the firmware and build the
++ *                      ring (all DRAM), then perform exactly one of the 0141
++ *                      CP register writes, index n, and stop.  The table is
++ *                      in mi6/docs/4k/cp-ringbuffer.md; one index per boot.
++ *   sweetcp=1          the old full 0141 path, kept but now also requires
++ *   sweetcpfull=1      sweetcpfull=1, so a stray sweetcp=1 cannot wedge a
++ *                      boot again.
++ *
++ * A plain boot runs nothing.  Non-fatal: every failure is one line and the
++ * boot continues -- unless the MMIO access itself wedges the interconnect,
++ * which is exactly the failure the two new modes are meant to localise.
+  *
+  * ---------------------------------------------------------------------------
+  * What is proven and where it was read
+@@ -107,11 +126,23 @@
+  *    is built to say which of those happened.
+  *
+  * Boot args (default off; a plain boot is unchanged):
+- *   sweetcp=1            run this stage
+- *   sweetcpdelay=<s>     seconds to wait first, 1..180, default 40.  It
+- *                        must run after the zap (default 20 s) in the same
+- *                        boot: without the zap the GPU is still secure and
+- *                        the CP cannot fetch non-secure microcode.
++ *   sweetcpprobe=1          read-only RBBM/CP dump; nothing is written
++ *   sweetcpprobedelay=<s>   seconds before it, 1..180, default 30 (after the
++ *                           zap, because RBBM_SECVID_TRUST_CNTL is readable
++ *                           only once the zap has released the GPU)
++ *   sweetcpprobesecvid=0    skip the one SECVID read (for a boot without the
++ *                           zap: that read is known to wedge beforehand)
++ *   sweetcpwrite=<n>        run the write bisect, n = 1..17; 0/missing = off
++ *   sweetcpwritedelay=<s>   seconds before it, 1..180, default 30
++ *   sweetcp=1 sweetcpfull=1 the old full path (both required)
++ *   sweetcpdelay=<s>        seconds before the full path, default 40.  Any
++ *                           mode that touches the CP must run after the zap
++ *                           (default 20 s) in the same boot: without it the
++ *                           GPU is still secure and the CP cannot fetch
++ *                           non-secure microcode.
++ *
++ * Priority if several are set: probe (read-only) wins over bisect, which
++ * wins over the full path; the ignored arguments are named in the log.
+  *
+  * Report, log lines and failure signatures: mi6/docs/4k/cp-ringbuffer.md.
+  * ---------------------------------------------------------------------------
+@@ -192,20 +223,30 @@ void sweet_cp_init(void);
+ /* ------------------------------------------------------------------ */
+ #define CP_RBBM_HW_VERSION	0x00000u	/* 0x000 << 2 */
+ #define CP_RBBM_STATUS		0x013d4u	/* 0x4f5 << 2 */
++#define CP_RBBM_STATUS3		0x014c0u	/* 0x530 << 2 */
+ #define CP_RBBM_AHB_ERROR	0x013b4u	/* 0x4ed << 2 */
+ #define CP_RBBM_AHB_ERR_STATUS	0x013d0u	/* 0x4f4 << 2 */
+ #define CP_RBBM_ME_SPLIT	0x013c0u	/* 0x4f0 << 2 */
+ #define CP_RBBM_PFP_SPLIT	0x013c4u	/* 0x4f1 << 2 */
+ #define CP_RBBM_AHB_CNTL0	0x0024cu	/* 0x093 << 2 */
+ #define CP_RBBM_AHB_CNTL1	0x00250u	/* 0x094 << 2 */
++#define CP_RBBM_AHB_CNTL2	0x00254u	/* 0x095 << 2 */
++#define CP_RBBM_SECVID_TRUST	0x3d000u	/* 0xf400 << 2, read-only! */
+ 
+ #define CP_RB_BASE		0x02000u	/* 0x800 << 2 */
+ #define CP_RB_BASE_HI		0x02004u	/* 0x801 << 2 */
+ #define CP_RB_CNTL		0x02008u	/* 0x802 << 2 */
+ #define CP_RB_RPTR		0x02018u	/* 0x806 << 2 */
+ #define CP_RB_WPTR		0x0201cu	/* 0x807 << 2 */
++#define CP_PFP_STAT_ADDR	0x02020u	/* 0x808 << 2 */
++#define CP_PFP_STAT_DATA	0x02024u	/* 0x809 << 2 */
++#define CP_ME_STAT_ADDR		0x02068u	/* 0x81a << 2 */
+ #define CP_ROQ_THRESHOLDS_1	0x0207cu	/* 0x81f << 2 */
+ #define CP_ROQ_THRESHOLDS_2	0x02080u	/* 0x820 << 2 */
++#define CP_ROQ_DBG_ADDR		0x02084u	/* 0x821 << 2 */
++#define CP_ROQ_DBG_DATA		0x02088u	/* 0x822 << 2 */
++#define CP_MEQ_DBG_ADDR		0x0208cu	/* 0x823 << 2 */
++#define CP_MEQ_DBG_DATA		0x02090u	/* 0x824 << 2 */
+ #define CP_MEQ_THRESHOLDS	0x02094u	/* 0x825 << 2 */
+ #define CP_MERCIU_SIZE		0x02098u	/* 0x826 << 2 */
+ #define CP_ME_CNTL		0x020c8u	/* 0x832 << 2 */
+@@ -214,6 +255,7 @@ void sweet_cp_init(void);
+ #define CP_PM4_INSTR_BASE_LO	0x020e0u	/* 0x838 << 2 */
+ #define CP_PM4_INSTR_BASE_HI	0x020e4u	/* 0x839 << 2 */
+ #define CP_ADDR_MODE_CNTL	0x02180u	/* 0x860 << 2 */
++#define CP_PROTECT_CNTL		0x02280u	/* 0x8a0 << 2 */
+ #define CP_ME_STAT_DATA		0x02c50u	/* 0xb14 << 2 */
+ #define CP_WFI_PEND_CTR		0x02c54u	/* 0xb15 << 2 */
+ #define CP_INTERRUPT_STATUS	0x02c60u	/* 0xb18 << 2 */
+@@ -225,8 +267,15 @@ void sweet_cp_init(void);
+ #define CP_IB1_BUFSZ		0x02c84u	/* 0xb21 << 2 */
+ 
+ /* RBBM_STATUS bits (a5xx.xml.h:1979-1986) */
++#define CP_STATUS_CP_ME_BUSY	(1u << 1)
++#define CP_STATUS_CP_PFP_BUSY	(1u << 2)
++#define CP_STATUS_CP_ETS_BUSY	(1u << 3)
+ #define CP_STATUS_CP_BUSY	(1u << 6)
+ #define CP_STATUS_GPU_BUSY_CP	(1u << 30)
++#define CP_STATUS_GPU_BUSY	(1u << 31)
++
++/* RBBM_STATUS3 bits (a5xx.xml.h:2025) */
++#define CP_STATUS3_SMMU_STALL	(1u << 24)
+ 
+ /* CP_INTERRUPT_STATUS bits (a5xx.xml.h:902-913) */
+ #define CP_INT_OPCODE		(1u << 0)
+@@ -319,10 +368,24 @@ static struct {
+ 	uint32_t	cp_fault0;
+ 	uint32_t	cp_ahb0;
+ 	uint32_t	gfsr0;
++	unsigned	probe_reads;
++	int		probe_secvid;
+ } scp;
+ 
++/* One mode per boot: 0142 selects exactly one of the three experiments. */
++enum {
++	SCP_MODE_OFF = 0,
++	SCP_MODE_PROBE,
++	SCP_MODE_BISECT,
++	SCP_MODE_FULL,
++};
++
++#define SCP_BISECT_MAX	17
++
+ static int scp_started;
+ static int scp_sleep_chan;
++static int scp_mode = SCP_MODE_OFF;
++static int scp_bisect_idx;
+ 
+ /* ------------------------------------------------------------------ */
+ /* MMIO helpers                                                        */
+@@ -1156,6 +1219,358 @@ scp_run(void)
+ 	    me_init_ok, ib_ok);
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* 0142 mode 1: read-only RBBM/CP probe                               */
++/*                                                                    */
++/* Prints the canary line BEFORE the read, then the value.  An MMIO   */
++/* read cannot be timed out: if it is aimed at a gated register the   */
++/* CPU (and, on this hypervisor, the interconnect) stops, so the last */
++/* line in the persistent log is the canary of the read that did not  */
++/* return.  Nothing below writes any register, and the SMMU is never  */
++/* mapped.                                                            */
++/* ------------------------------------------------------------------ */
++static uint32_t
++scp_probe_read(const char *name, uint32_t off)
++{
++	uint32_t v;
++
++	scp.probe_reads++;
++	printf(CP_PFX "probe  %-26s [0x%05x] phys 0x%08x ...\n", name, off,
++	    CP_KGSL_PA + off);
++	__asm__ volatile("dsb sy" ::: "memory");
++	v = scp_rd(scp.kgsl, off);
++	printf(CP_PFX "  -->  %-26s [0x%05x] = 0x%08x\n", name, off, v);
++	__asm__ volatile("dsb sy" ::: "memory");
++	return v;
++}
++
++static void
++scp_probe_run(void)
++{
++	uint32_t v, ver;
++
++	printf(CP_PFX "--- read-only RBBM/CP probe start (no writes, SMMU not "
++	    "mapped) ---\n");
++	scp.kgsl = ml_io_map(CP_KGSL_PA, CP_KGSL_SZ);
++	if (scp.kgsl == 0) {
++		printf(CP_PFX "probe: ml_io_map(0x%08x, 0x%x) failed; nothing "
++		    "touched\n", CP_KGSL_PA, CP_KGSL_SZ);
++		return;
++	}
++	printf(CP_PFX "probe: mapped kgsl 0x%08x+0x%x at va 0x%lx read-only\n",
++	    CP_KGSL_PA, CP_KGSL_SZ, (unsigned long)scp.kgsl);
++
++	/* The first read is also the liveness gate.  If the window is not
++	 * clocked the whole probe is pointless and, worse, every later read
++	 * may wedge; stop here and say why. */
++	ver = scp_probe_read("RBBM_HW_VERSION", CP_RBBM_HW_VERSION);
++	if (ver == 0 || ver == 0xffffffffu) {
++		printf(CP_PFX "probe: RBBM does not answer (0x%08x); the GPU "
++		    "window is not clocked.  Boot sweetgpuprobe=1 first (it is "
++		    "what leaves the GDSCs and gfx3d root clock on).  Stopping "
++		    "before any other read.\n", ver);
++		return;
++	}
++
++	v = scp_probe_read("RBBM_STATUS", CP_RBBM_STATUS);
++	printf(CP_PFX "  RBBM_STATUS: GPU_BUSY_IGN_AHB=%u "
++	    "GPU_BUSY_IGN_AHB_CP=%u CP_BUSY=%u CP_ME_BUSY=%u CP_PFP_BUSY=%u "
++	    "CP_ETS_BUSY=%u.  There is no RBBM_GPU_BUSY register on A5xx; "
++	    "the \"GPU busy\" signals are bits 31/30 of this word.\n",
++	    (v & CP_STATUS_GPU_BUSY) ? 1u : 0u,
++	    (v & CP_STATUS_GPU_BUSY_CP) ? 1u : 0u,
++	    (v & CP_STATUS_CP_BUSY) ? 1u : 0u,
++	    (v & CP_STATUS_CP_ME_BUSY) ? 1u : 0u,
++	    (v & CP_STATUS_CP_PFP_BUSY) ? 1u : 0u,
++	    (v & CP_STATUS_CP_ETS_BUSY) ? 1u : 0u);
++
++	v = scp_probe_read("RBBM_STATUS3", CP_RBBM_STATUS3);
++	printf(CP_PFX "  RBBM_STATUS3: SMMU_STALLED_ON_FAULT=%u\n",
++	    (v & CP_STATUS3_SMMU_STALL) ? 1u : 0u);
++
++	(void)scp_probe_read("RBBM_AHB_ERROR_STATUS", CP_RBBM_AHB_ERR_STATUS);
++	(void)scp_probe_read("RBBM_AHB_ERROR", CP_RBBM_AHB_ERROR);
++	(void)scp_probe_read("RBBM_AHB_CNTL0", CP_RBBM_AHB_CNTL0);
++	(void)scp_probe_read("RBBM_AHB_CNTL1", CP_RBBM_AHB_CNTL1);
++	(void)scp_probe_read("RBBM_AHB_CNTL2", CP_RBBM_AHB_CNTL2);
++	(void)scp_probe_read("RBBM_AHB_ME_SPLIT", CP_RBBM_ME_SPLIT);
++	(void)scp_probe_read("RBBM_AHB_PFP_SPLIT", CP_RBBM_PFP_SPLIT);
++
++	/* Ring buffer block. */
++	(void)scp_probe_read("CP_RB_BASE", CP_RB_BASE);
++	(void)scp_probe_read("CP_RB_BASE_HI", CP_RB_BASE_HI);
++	v = scp_probe_read("CP_RB_CNTL", CP_RB_CNTL);
++	printf(CP_PFX "  CP_RB_CNTL: BUFSZ=%u BLKSZ=%u NO_UPDATE=%u "
++	    "(BUFSZ = log2(ring bytes/8), BLKSZ = log2(block bytes/8))\n",
++	    v & 0x3fu, (v >> 8) & 0x1fu, (v >> 15) & 1u);
++	(void)scp_probe_read("CP_RB_RPTR", CP_RB_RPTR);
++	(void)scp_probe_read("CP_RB_WPTR", CP_RB_WPTR);
++
++	/* Queues: thresholds and their debug windows. */
++	(void)scp_probe_read("CP_PFP_STAT_ADDR", CP_PFP_STAT_ADDR);
++	(void)scp_probe_read("CP_PFP_STAT_DATA", CP_PFP_STAT_DATA);
++	(void)scp_probe_read("CP_ROQ_THRESHOLDS_1", CP_ROQ_THRESHOLDS_1);
++	(void)scp_probe_read("CP_ROQ_THRESHOLDS_2", CP_ROQ_THRESHOLDS_2);
++	(void)scp_probe_read("CP_ROQ_DBG_ADDR", CP_ROQ_DBG_ADDR);
++	(void)scp_probe_read("CP_ROQ_DBG_DATA", CP_ROQ_DBG_DATA);
++	(void)scp_probe_read("CP_MEQ_DBG_ADDR", CP_MEQ_DBG_ADDR);
++	(void)scp_probe_read("CP_MEQ_DBG_DATA", CP_MEQ_DBG_DATA);
++	(void)scp_probe_read("CP_MEQ_THRESHOLDS", CP_MEQ_THRESHOLDS);
++	(void)scp_probe_read("CP_MERCIU_SIZE", CP_MERCIU_SIZE);
++
++	/* Microcode bases and ME state. */
++	(void)scp_probe_read("CP_ME_CNTL", CP_ME_CNTL);
++	v = scp_probe_read("CP_ME_STAT_ADDR", CP_ME_STAT_ADDR);
++	printf(CP_PFX "  CP_ME_STAT_ADDR: 0x%08x\n", v);
++	(void)scp_probe_read("CP_PFP_INSTR_BASE_LO", CP_PFP_INSTR_BASE_LO);
++	(void)scp_probe_read("CP_PFP_INSTR_BASE_HI", CP_PFP_INSTR_BASE_HI);
++	(void)scp_probe_read("CP_PM4_INSTR_BASE_LO", CP_PM4_INSTR_BASE_LO);
++	(void)scp_probe_read("CP_PM4_INSTR_BASE_HI", CP_PM4_INSTR_BASE_HI);
++	(void)scp_probe_read("CP_ADDR_MODE_CNTL", CP_ADDR_MODE_CNTL);
++	(void)scp_probe_read("CP_PROTECT_CNTL", CP_PROTECT_CNTL);
++
++	/* Status / fault registers. */
++	(void)scp_probe_read("CP_ME_STAT_DATA", CP_ME_STAT_DATA);
++	(void)scp_probe_read("CP_WFI_PEND_CTR", CP_WFI_PEND_CTR);
++	v = scp_probe_read("CP_INTERRUPT_STATUS", CP_INTERRUPT_STATUS);
++	printf(CP_PFX "  CP_INTERRUPT_STATUS: opcode=%u reserved=%u "
++	    "hw_fault=%u dma=%u protect=%u ahb=%u\n",
++	    (v & CP_INT_OPCODE) ? 1u : 0u,
++	    (v & CP_INT_RESERVED) ? 1u : 0u,
++	    (v & CP_INT_HW_FAULT) ? 1u : 0u,
++	    (v & CP_INT_DMA) ? 1u : 0u,
++	    (v & CP_INT_PROTECT) ? 1u : 0u,
++	    (v & CP_INT_AHB) ? 1u : 0u);
++	(void)scp_probe_read("CP_HW_FAULT", CP_HW_FAULT);
++	v = scp_probe_read("CP_AHB_FAULT", CP_AHB_FAULT);
++	printf(CP_PFX "  CP_AHB_FAULT: addr 0x%05x access=%s error=%u\n",
++	    v & 0xfffffu, scp_ahb_access(v), (v >> 31) & 1u);
++	(void)scp_probe_read("CP_PROTECT_STATUS", CP_PROTECT_STATUS);
++	(void)scp_probe_read("CP_IB1_BASE", CP_IB1_BASE);
++	(void)scp_probe_read("CP_IB1_BASE_HI", CP_IB1_BASE_HI);
++	(void)scp_probe_read("CP_IB1_BUFSZ", CP_IB1_BUFSZ);
++
++	/* SECVID last: before the zap this exact read is known to wedge the
++	 * bus, and every other answer is already in the log by now. */
++	if (scp.probe_secvid) {
++		printf(CP_PFX "probe: last read is RBBM_SECVID_TRUST_CNTL.  It "
++		    "is only readable after the zap has released the GPU; if "
++		    "the log stops after the next line, this boot had no "
++		    "working zap (or set sweetcpprobesecvid=0).\n");
++		v = scp_probe_read("RBBM_SECVID_TRUST_CNTL",
++		    CP_RBBM_SECVID_TRUST);
++		printf(CP_PFX "  RBBM_SECVID_TRUST_CNTL: 0x%08x (%s)\n", v,
++		    v == 1u ? "GPU released from secure mode" :
++		    "not the post-zap value 1; still secure or unexpected");
++	} else {
++		printf(CP_PFX "probe: RBBM_SECVID_TRUST_CNTL skipped "
++		    "(sweetcpprobesecvid=0)\n");
++	}
++
++	printf(CP_PFX "probe: done: %u reads returned, no register written "
++	    "(the SMMU was never mapped)\n", scp.probe_reads);
++}
++
++/* ------------------------------------------------------------------ */
++/* 0142 mode 2: write bisect -- exactly one CP register write         */
++/*                                                                    */
++/* Each boot performs one of the 0141 init writes, after the same     */
++/* DRAM setup (firmware copy, ring build) and the same idempotent     */
++/* power-up, then stops.  Index 15 is the one exception: clearing     */
++/* ME_HALT with CP_PFP/PM4_INSTR_BASE still 0 would start the CP at   */
++/* physical 0, so that index programs the four instruction bases      */
++/* first and says so in the log.  The tested write is still only the  */
++/* CP_ME_CNTL one; the bases are prerequisites that indices 8..11     */
++/* test on their own.                                                 */
++/* ------------------------------------------------------------------ */
++static int
++scp_bisect_target(int idx, const char **name, uint32_t *off, uint32_t *val)
++{
++	switch (idx) {
++	case 1:
++		*name = "CP_MEQ_THRESHOLDS";
++		*off = CP_MEQ_THRESHOLDS;
++		*val = 0x00000040u;
++		break;
++	case 2:
++		*name = "CP_MERCIU_SIZE";
++		*off = CP_MERCIU_SIZE;
++		*val = 0x00000400u;
++		break;
++	case 3:
++		*name = "CP_ROQ_THRESHOLDS_2";
++		*off = CP_ROQ_THRESHOLDS_2;
++		*val = 0x80000060u;
++		break;
++	case 4:
++		*name = "CP_ROQ_THRESHOLDS_1";
++		*off = CP_ROQ_THRESHOLDS_1;
++		*val = 0x40201b16u;
++		break;
++	case 5:
++		*name = "CP_ADDR_MODE_CNTL";
++		*off = CP_ADDR_MODE_CNTL;
++		*val = 0x00000001u;
++		break;
++	case 6:
++		*name = "RBBM_AHB_CNTL0";
++		*off = CP_RBBM_AHB_CNTL0;
++		*val = 0x00000001u;
++		break;
++	case 7:
++		*name = "RBBM_AHB_CNTL1";
++		*off = CP_RBBM_AHB_CNTL1;
++		*val = 0xa6ffffffu;
++		break;
++	case 8:
++		*name = "CP_PFP_INSTR_BASE_LO";
++		*off = CP_PFP_INSTR_BASE_LO;
++		*val = (uint32_t)scp.pfp_pa;
++		break;
++	case 9:
++		*name = "CP_PFP_INSTR_BASE_HI";
++		*off = CP_PFP_INSTR_BASE_HI;
++		*val = (uint32_t)(scp.pfp_pa >> 32);
++		break;
++	case 10:
++		*name = "CP_PM4_INSTR_BASE_LO";
++		*off = CP_PM4_INSTR_BASE_LO;
++		*val = (uint32_t)scp.pm4_pa;
++		break;
++	case 11:
++		*name = "CP_PM4_INSTR_BASE_HI";
++		*off = CP_PM4_INSTR_BASE_HI;
++		*val = (uint32_t)(scp.pm4_pa >> 32);
++		break;
++	case 12:
++		*name = "CP_RB_CNTL";
++		*off = CP_RB_CNTL;
++		*val = CP_RB_CNTL_BUFSZ(9) | CP_RB_CNTL_BLKSZ(2) |
++		    CP_RB_CNTL_NO_UPDATE;
++		break;
++	case 13:
++		*name = "CP_RB_BASE";
++		*off = CP_RB_BASE;
++		*val = (uint32_t)scp.ring_pa;
++		break;
++	case 14:
++		*name = "CP_RB_BASE_HI";
++		*off = CP_RB_BASE_HI;
++		*val = (uint32_t)(scp.ring_pa >> 32);
++		break;
++	case 15:
++		*name = "CP_ME_CNTL";
++		*off = CP_ME_CNTL;
++		*val = 0x00000000u;
++		break;
++	case 16:
++		*name = "CP_RB_WPTR (CP_ME_INIT doorbell)";
++		*off = CP_RB_WPTR;
++		*val = 9u;
++		break;
++	case 17:
++		*name = "CP_RB_WPTR (IB doorbell)";
++		*off = CP_RB_WPTR;
++		*val = 13u;
++		break;
++	default:
++		return -1;
++	}
++	return 0;
++}
++
++static void
++scp_bisect_prewrite(const char *name, uint32_t off, uint32_t val)
++{
++	printf(CP_PFX "bisect: prerequisite write %s [0x%05x] = 0x%08x "
++	    "(only for index 15; the ME must not start at physical 0)\n",
++	    name, off, val);
++	__asm__ volatile("dsb sy" ::: "memory");
++	scp_wr_raw(scp.kgsl, off, val);
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf(CP_PFX "bisect: prerequisite %s reads back 0x%08x\n", name,
++	    scp_rd(scp.kgsl, off));
++}
++
++static void
++scp_bisect_run(int idx)
++{
++	const char *name = "?";
++	uint32_t off = 0, val = 0, rb;
++
++	printf(CP_PFX "--- CP write bisect start: index %d, one tested write ---\n",
++	    idx);
++
++	/* DRAM setup first: it needs no GPU power and makes the instruction
++	 * base / ring addresses in the table real.  These are memcpy()s, not
++	 * register writes. */
++	if (scp_map_low() != 0) {
++		printf(CP_PFX "bisect: no low region; nothing written\n");
++		return;
++	}
++	if (sweet_a530_cp_fw_count < 2) {
++		printf(CP_PFX "bisect: generated firmware table has %lu entries, "
++		    "need 2\n", sweet_a530_cp_fw_count);
++		return;
++	}
++	if (scp_copy_one(&sweet_a530_cp_fw[0], scp.pfp_pa, "a530_pfp.fw") != 0
++	    || scp_copy_one(&sweet_a530_cp_fw[1], scp.pm4_pa,
++	    "a530_pm4.fw") != 0) {
++		printf(CP_PFX "bisect: firmware copy failed; nothing written\n");
++		return;
++	}
++	scp_build();
++	printf(CP_PFX "bisect: DRAM setup done (the lines above are not "
++	    "register writes)\n");
++
++	/* Same idempotent power sequence as the full path: GPUCC/GCC and
++	 * GDSC writes only, no CP register yet.  If the log stops here, the
++	 * culprit is in the power sequence, not in the CP. */
++	printf(CP_PFX "bisect: powering the GPU block (GPUCC/GCC/GDSC, no CP "
++	    "register yet)\n");
++	if (scp_power_up() != 0) {
++		printf(CP_PFX "bisect: power-up failed; no CP register "
++		    "written\n");
++		return;
++	}
++
++	if (scp_bisect_target(idx, &name, &off, &val) != 0) {
++		printf(CP_PFX "bisect: index %d is not in the table; no CP "
++		    "register written\n", idx);
++		return;
++	}
++
++	if (idx == 15) {
++		scp_bisect_prewrite("CP_PFP_INSTR_BASE_LO",
++		    CP_PFP_INSTR_BASE_LO, (uint32_t)scp.pfp_pa);
++		scp_bisect_prewrite("CP_PFP_INSTR_BASE_HI",
++		    CP_PFP_INSTR_BASE_HI, (uint32_t)(scp.pfp_pa >> 32));
++		scp_bisect_prewrite("CP_PM4_INSTR_BASE_LO",
++		    CP_PM4_INSTR_BASE_LO, (uint32_t)scp.pm4_pa);
++		scp_bisect_prewrite("CP_PM4_INSTR_BASE_HI",
++		    CP_PM4_INSTR_BASE_HI, (uint32_t)(scp.pm4_pa >> 32));
++	}
++
++	printf(CP_PFX "bisect #%d: writing %s [0x%05x] = 0x%08x; %s\n", idx,
++	    name, off, val, idx == 15 ? "this is the tested write (the four "
++	    "lines above are its prerequisites)" : "this is the only CP "
++	    "register write of this boot");
++	__asm__ volatile("dsb sy" ::: "memory");
++	scp_wr_raw(scp.kgsl, off, val);
++	printf(CP_PFX "bisect #%d: write returned (the bus did not wedge)\n",
++	    idx);
++	__asm__ volatile("dsb sy" ::: "memory");
++	rb = scp_rd(scp.kgsl, off);
++	printf(CP_PFX "bisect #%d: %s [0x%05x] reads back 0x%08x%s\n", idx,
++	    name, off, rb, rb == val ? "" : "  <-- DID NOT STICK");
++	printf(CP_PFX "bisect #%d: stopping on purpose.  Next index %d "
++	    "(sweetcpwrite=0 stops).\n", idx,
++	    idx < SCP_BISECT_MAX ? idx + 1 : 0);
++
++	/* No CP_ME_CNTL read-back poll, no status dump: every extra access is
++	 * another chance to wedge, and one boot answers one question. */
++}
++
+ /* ------------------------------------------------------------------ */
+ /* Thread + entry point                                                */
+ /* ------------------------------------------------------------------ */
+@@ -1173,7 +1588,19 @@ static void
+ scp_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	scp_sleep_s(scp.delay_s);
+-	scp_run();
++	switch (scp_mode) {
++	case SCP_MODE_PROBE:
++		scp_probe_run();
++		break;
++	case SCP_MODE_BISECT:
++		scp_bisect_run(scp_bisect_idx);
++		break;
++	case SCP_MODE_FULL:
++		scp_run();
++		break;
++	default:
++		break;
++	}
+ 	printf(CP_PFX "thread exiting\n");
+ 	(void)thread_terminate(current_thread());
+ }
+@@ -1182,7 +1609,11 @@ void
+ sweet_cp_init(void)
+ {
+ 	int enabled = 0;
+-	int delay_s = 40;
++	int full = 0;
++	int probe = 0;
++	int write = 0;
++	int secvid = 1;
++	int delay_s = 0;
+ 	thread_t thread;
+ 
+ 	if (scp_started) {
+@@ -1191,12 +1622,67 @@ sweet_cp_init(void)
+ 	scp_started = 1;
+ 
+ 	(void)PE_parse_boot_argn("sweetcp", &enabled, sizeof(enabled));
+-	(void)PE_parse_boot_argn("sweetcpdelay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("sweetcpfull", &full, sizeof(full));
++	(void)PE_parse_boot_argn("sweetcpprobe", &probe, sizeof(probe));
++	(void)PE_parse_boot_argn("sweetcpwrite", &write, sizeof(write));
++
++	/* A typo in the index must not silently fall through to another
++	 * mode: refuse the boot arg before anything runs. */
++	if (write < 0 || write > SCP_BISECT_MAX) {
++		printf(CP_PFX "sweetcpwrite=%d is outside 0..%d; nothing "
++		    "run\n", write, SCP_BISECT_MAX);
++		return;
++	}
+ 
+-	if (!enabled) {
+-		printf(CP_PFX "disabled (sweetcp=0)\n");
++	if (!probe && write == 0 && !(enabled && full)) {
++		if (enabled && !full) {
++			printf(CP_PFX "sweetcp=1 no longer runs the full 0141 "
++			    "path by itself (it wedged the phone on its first "
++			    "hardware run).  Add sweetcpfull=1 for that, or "
++			    "use sweetcpprobe=1 / sweetcpwrite=<n>.\n");
++		} else if (full && !enabled) {
++			printf(CP_PFX "sweetcpfull=1 needs sweetcp=1 as well; "
++			    "nothing run\n");
++		} else {
++			printf(CP_PFX "disabled (no sweetcpprobe, "
++			    "sweetcpwrite or sweetcp+sweetcpfull)\n");
++		}
+ 		return;
+ 	}
++
++	if (probe) {
++		scp_mode = SCP_MODE_PROBE;
++		delay_s = 30;
++		(void)PE_parse_boot_argn("sweetcpprobedelay", &delay_s,
++		    sizeof(delay_s));
++		(void)PE_parse_boot_argn("sweetcpprobesecvid", &secvid,
++		    sizeof(secvid));
++		scp.probe_secvid = (secvid != 0);
++		if (enabled) {
++			printf(CP_PFX "sweetcp=1 ignored: the read-only probe "
++			    "wins\n");
++		}
++		if (write != 0) {
++			printf(CP_PFX "sweetcpwrite=%d ignored: the read-only "
++			    "probe wins\n", write);
++		}
++	} else if (write != 0) {
++		scp_mode = SCP_MODE_BISECT;
++		scp_bisect_idx = write;
++		delay_s = 30;
++		(void)PE_parse_boot_argn("sweetcpwritedelay", &delay_s,
++		    sizeof(delay_s));
++		if (enabled) {
++			printf(CP_PFX "sweetcp=1 ignored: the write bisect "
++			    "wins\n");
++		}
++	} else {
++		scp_mode = SCP_MODE_FULL;
++		delay_s = 40;
++		(void)PE_parse_boot_argn("sweetcpdelay", &delay_s,
++		    sizeof(delay_s));
++	}
++
+ 	if (delay_s < 1) {
+ 		delay_s = 1;
+ 	}
+@@ -1205,8 +1691,27 @@ sweet_cp_init(void)
+ 	}
+ 	scp.delay_s = (unsigned)delay_s;
+ 
+-	printf(CP_PFX "enabled: CP bring-up in %u s (needs the zap from this "
+-	    "boot: sweetzap=1)\n", scp.delay_s);
++	switch (scp_mode) {
++	case SCP_MODE_PROBE:
++		printf(CP_PFX "probe enabled: read-only dump in %u s (no "
++		    "writes, SMMU not mapped; run sweetgpuprobe=1 so the "
++		    "window is clocked)\n", scp.delay_s);
++		break;
++	case SCP_MODE_BISECT:
++		printf(CP_PFX "write bisect enabled: index %d in %u s "
++		    "(power-up plus one tested CP register write; index 15 "
++		    "adds its instruction-base prerequisites)\n",
++		    scp_bisect_idx, scp.delay_s);
++		break;
++	case SCP_MODE_FULL:
++		printf(CP_PFX "FULL path enabled (sweetcpfull=1): CP bring-up "
++		    "in %u s (needs the zap from this boot: sweetzap=1)\n",
++		    scp.delay_s);
++		break;
++	default:
++		printf(CP_PFX "internal error: no mode selected\n");
++		return;
++	}
+ 
+ 	kern_return_t kr = kernel_thread_start(scp_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
